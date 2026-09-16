@@ -1,0 +1,10 @@
+{
+ "status": true,
+ "code": 200,
+ "data": {
+  "1878744732215119872": {"id":"1878744732215119872","label":"136","name":"1行9列","status":"AWAY","afterFree":false},
+  "1878744732215119873": {"id":"1878744732215119873","label":"137","name":"1行10列","status":"FREE","afterFree":true},
+  "1878744732215119874": {"id":"1878744732215119874","label":"138","name":"1行11列","status":"FULL","afterFree":false},
+  "1878744732215119875": {"id":"1878744732215119875","label":"060","name":"2行3列","status":"FREE","afterFree":true}
+ }
+}

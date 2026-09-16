@@ -1,0 +1,72 @@
+{
+ "status": true,
+ "data": {
+  "totalCount": 4,
+  "pageList": [
+   {
+    "id": "1878649390807224320",
+    "buildingId": "1875080631899230208",
+    "floorId": "1876808903766937600",
+    "name": "B1自习区",
+    "nameE": "B1_self_study_area",
+    "seatTotal": 84,
+    "seatLock": 2,
+    "seatScene": 82,
+    "seatFree": 41,
+    "buildingName": "图书馆",
+    "floorName": "B1",
+    "maxMinute": 900,
+    "type": "NORMAL",
+    "randMake": 1
+   },
+   {
+    "id": "1877625107981111296",
+    "buildingId": "1875080631899230208",
+    "floorId": "1876448627456577536",
+    "name": "1F外文一区",
+    "nameE": "1F外文一区",
+    "seatTotal": 76,
+    "seatLock": 0,
+    "seatScene": 0,
+    "seatFree": 20,
+    "buildingName": "图书馆",
+    "floorName": "一楼",
+    "maxMinute": 900,
+    "type": "NORMAL",
+    "randMake": 1
+   },
+   {
+    "id": "1877596156269268992",
+    "buildingId": "1875080631899230208",
+    "floorId": "1876448627456577536",
+    "name": "1F外文二区",
+    "nameE": "1F外文二区",
+    "seatTotal": 69,
+    "seatLock": 0,
+    "seatScene": 0,
+    "seatFree": 16,
+    "buildingName": "图书馆",
+    "floorName": "一楼",
+    "maxMinute": 900,
+    "type": "NORMAL",
+    "randMake": 1
+   },
+   {
+    "id": "1877247337010663424",
+    "buildingId": "1875080631899230208",
+    "floorId": "1876448627456577536",
+    "name": "1F中外文报刊",
+    "nameE": "1F中外文报刊",
+    "seatTotal": 202,
+    "seatLock": 0,
+    "seatScene": 0,
+    "seatFree": 72,
+    "buildingName": "图书馆",
+    "floorName": "一楼",
+    "maxMinute": 900,
+    "type": "NORMAL",
+    "randMake": 1
+   }
+  ]
+ }
+}
