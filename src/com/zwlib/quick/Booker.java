@@ -55,6 +55,12 @@ final class Booker {
     static final class Cfg {
         boolean enabled;
         boolean dryRun = true;         // safety default: never book until the user clears it
+        boolean ciEnabled;             // 暂离自动返回（默认关）
+        boolean ciDry = true;          // 守护试运行：只记录，不调返回接口
+        int ciGraceMin = 60;           // 平时：离座后多久算超时（图书馆规矩 1 小时）
+        int ciMealGraceMin = 120;      // 饭点：宽限 2 小时
+        int ciMealStartMin = 11 * 60;  // 饭点 11:00
+        int ciMealEndMin = 13 * 60 + 30;
         int minuteOfDay = 7 * 60 + 30; // 07:30
         String venueId = "";
         String venueName = "";
@@ -66,12 +72,20 @@ final class Booker {
         String dateLabel = "";
         int beginMinute = -1;          // -1 = 未设置，必须每次自己指定
         int endMinute = -1;
+        int ciBeginMinute = 7 * 60;        // 自动签到守护时段（默认 07:00，与预约时段完全独立）
+        int ciEndMinute = 22 * 60 + 30;    // 自动签到守护时段（默认 22:30）
 
         static Cfg load(Context c) {
             SharedPreferences p = c.getSharedPreferences("zw_flags", Context.MODE_PRIVATE);
             Cfg f = new Cfg();
             f.enabled = p.getBoolean("bk_enabled", false);
             f.dryRun = p.getBoolean("bk_dry", true);
+            f.ciEnabled = p.getBoolean("bk_ci_enabled", false);
+            f.ciDry = p.getBoolean("bk_ci_dry", true);
+            f.ciGraceMin = p.getInt("bk_ci_grace", 60);
+            f.ciMealGraceMin = p.getInt("bk_ci_meal_grace", 120);
+            f.ciMealStartMin = p.getInt("bk_ci_meal_start", 11 * 60);
+            f.ciMealEndMin = p.getInt("bk_ci_meal_end", 13 * 60 + 30);
             f.minuteOfDay = p.getInt("bk_time", 7 * 60 + 30);
             f.venueId = p.getString("bk_venue", "");
             f.venueName = p.getString("bk_venue_name", "");
@@ -83,6 +97,8 @@ final class Booker {
             f.seatPriority = p.getString("bk_seat_priority", "");
             f.beginMinute = p.getInt("bk_begin", -1);
             f.endMinute = p.getInt("bk_end", -1);
+            f.ciBeginMinute = p.getInt("bk_ci_begin", 7 * 60);
+            f.ciEndMinute = p.getInt("bk_ci_end", 22 * 60 + 30);
             return f;
         }
 
@@ -90,6 +106,12 @@ final class Booker {
             c.getSharedPreferences("zw_flags", Context.MODE_PRIVATE).edit()
                     .putBoolean("bk_enabled", enabled)
                     .putBoolean("bk_dry", dryRun)
+                    .putBoolean("bk_ci_enabled", ciEnabled)
+                    .putBoolean("bk_ci_dry", ciDry)
+                    .putInt("bk_ci_grace", ciGraceMin)
+                    .putInt("bk_ci_meal_grace", ciMealGraceMin)
+                    .putInt("bk_ci_meal_start", ciMealStartMin)
+                    .putInt("bk_ci_meal_end", ciMealEndMin)
                     .putInt("bk_time", minuteOfDay)
                     .putString("bk_venue", venueId)
                     .putString("bk_venue_name", venueName)
@@ -101,6 +123,8 @@ final class Booker {
                     .putString("bk_date_label", dateLabel)
                     .putInt("bk_begin", beginMinute)
                     .putInt("bk_end", endMinute)
+                    .putInt("bk_ci_begin", ciBeginMinute)
+                    .putInt("bk_ci_end", ciEndMinute)
                     .apply();
         }
 
@@ -110,6 +134,12 @@ final class Booker {
 
         String windowText() {
             return hasWindow() ? (hhmm(beginMinute) + " - " + hhmm(endMinute)) : "未设置";
+        }
+
+        boolean hasCiWindow() { return ciBeginMinute >= 0 && ciEndMinute > ciBeginMinute; }
+
+        String ciWindowText() {
+            return hasCiWindow() ? (hhmm(ciBeginMinute) + " - " + hhmm(ciEndMinute)) : "07:00 - 22:30";
         }
     }
 
@@ -815,6 +845,802 @@ final class Booker {
         }
         r.text = b.toString();
         return r;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 签到状态 · 暂离守护                                                  */
+    /* ------------------------------------------------------------------ */
+
+    static final String CUR_MAKE = "/static/frontApi/user/currentUseMake";
+    static final String DOOR_LOG = "/static/frontApi/user/doorLog/";
+    /** 站点 PC 代码里就是这一行：qrMd5 传字面量 "PC"，PC 渠道不真扫二维码。 */
+    static final String CHECK_IN = "/static/frontApi/make/checkIn?qrMd5=PC";
+    static final String ST_AWAY = "AWAY";
+
+    /** 当前有效预约的快照；has=false 表示服务端说此刻没有有效预约。 */
+    static final class Now {
+        boolean has;
+        String state = "";
+        String id, date, begin, end, place, seat;
+        String awayRange;          // 站点的「暂离/返回时间」，如 "14:38~15:38"
+
+        String text() {
+            if (!has) {
+                return "服务端说此刻没有有效预约";
+            }
+            StringBuilder b = new StringBuilder(stateText(state));
+            if (place != null) {
+                b.append(" · ").append(place.replace('|', ' ').trim());
+            }
+            if (seat != null) {
+                b.append(' ').append(seat);
+            }
+            if (date != null || begin != null) {
+                b.append('\n');
+                if (date != null) {
+                    b.append(date).append(' ');
+                }
+                if (begin != null) {
+                    b.append(begin);
+                }
+                if (end != null) {
+                    b.append('-').append(end);
+                }
+            }
+            return b.toString();
+        }
+    }
+
+    /** 一次巡检的结果：WatchReceiver 拿它决定发不发通知、下一次什么时候跑。 */
+    static final class Tick {
+        boolean ok;
+        boolean notify;
+        boolean ask;           // 这一轮发的是「要不要帮你签到」的询问（带两个按钮）
+        boolean awayActive;    // 这一轮服务端说「暂离」
+        boolean cancelAsk;     // 暂离结束 / 已经处理过 → 撤掉那条询问
+        String kind = "";      // 用于同一状态不重复打扰（见 WatchReceiver）
+        String title = "";
+        String body = "";
+        String detail = "";
+        String line = "还没巡检过";
+        long leftMin = -1;     // 距预计释放还剩几分钟（-1 = 不知道）
+        long nextAt;           // 下一次巡检的绝对时间；0 = 收工
+    }
+
+    /** 一次「暂离」过程中的状态：用户答没答、催了几次、从什么时候离座。存普通 prefs。 */
+    static final class Away {
+        String id = "";
+        long since;            // 离座时刻（毫秒）：优先服务端给的，其次门禁记录，最后第一次观测
+        long askedAt;          // 上一次询问的时刻
+        int asked;
+        String decision = "";  // "" 没答 / "yes" 立刻签 / "no" 用户说别管
+
+        static Away load(Context c) {
+            Away a = new Away();
+            android.content.SharedPreferences p =
+                    c.getSharedPreferences("zw_flags", Context.MODE_PRIVATE);
+            a.id = p.getString("ci_away_id", "");
+            a.since = p.getLong("ci_away_since", 0);
+            a.askedAt = p.getLong("ci_away_asked_at", 0);
+            a.asked = p.getInt("ci_away_asked", 0);
+            a.decision = p.getString("ci_away_decision", "");
+            return a;
+        }
+
+        void save(Context c) {
+            c.getSharedPreferences("zw_flags", Context.MODE_PRIVATE).edit()
+                    .putString("ci_away_id", id)
+                    .putLong("ci_away_since", since)
+                    .putLong("ci_away_asked_at", askedAt)
+                    .putInt("ci_away_asked", asked)
+                    .putString("ci_away_decision", decision)
+                    .apply();
+        }
+
+        static void reset(Context c) {
+            c.getSharedPreferences("zw_flags", Context.MODE_PRIVATE).edit()
+                    .remove("ci_away_id").remove("ci_away_since").remove("ci_away_asked_at")
+                    .remove("ci_away_asked").remove("ci_away_decision").apply();
+        }
+    }
+
+    /** 站点自己的 status 文案（bundle 里 my.table1.status1..8）。 */
+    static String stateText(String state) {
+        String s = state == null ? "" : state.trim().toUpperCase(Locale.US);
+        if ("RESERVE".equals(s)) {
+            return "预约（未签到）";
+        }
+        if ("CHECK_IN".equals(s)) {
+            return "履约中（已签到）";
+        }
+        if ("AWAY".equals(s)) {
+            return "暂离";
+        }
+        if ("LEAVE_EARLY".equals(s)) {
+            return "早退";
+        }
+        if ("STOP".equals(s)) {
+            return "已结束";
+        }
+        if ("NO_STOP".equals(s)) {
+            return "未签退";
+        }
+        if ("MISS".equals(s)) {
+            return "失约";
+        }
+        if ("CANCEL".equals(s)) {
+            return "已取消";
+        }
+        return s.isEmpty() ? "状态未知" : s;
+    }
+
+    /**
+     * Pure. /user/currentUseMake → 当前有效预约。
+     * 字段名沿用站点自己的 currentBook（与 freeBook 的 orderObj 同一套）。
+     * "没有有效预约"时服务端给 data:{}，这里当没有处理。
+     */
+    static Now parseNow(JSONObject resp) {
+        Now n = new Now();
+        if (resp == null || !resp.optBoolean("status")) {
+            return n;
+        }
+        JSONObject d = resp.optJSONObject("data");
+        if (d == null || d.length() == 0) {
+            return n;
+        }
+        String state = firstStr(d, "status", "makeStatus", "state");
+        String id = firstStr(d, "id", "makeId");
+        if (state == null && id == null) {
+            return n;
+        }
+        n.has = true;
+        n.state = state == null ? "" : state.trim().toUpperCase(Locale.US);
+        n.id = id;
+        n.date = firstStr(d, "makeDateStr", "date");
+        n.begin = firstStr(d, "makeBeginStr", "beginTime");
+        n.end = firstStr(d, "makeEndStr", "endTime");
+        n.place = firstStr(d, "location", "locationE");
+        n.seat = firstStr(d, "seatLabel");
+        n.awayRange = firstStr(d, "awayRange");
+        return n;
+    }
+
+    /** Pure. "12:05" → 725；解析不出来返回 -1。"12:05:00" 也收。 */
+    static int minuteText(String hhmm) {
+        if (hhmm == null) {
+            return -1;
+        }
+        String t = hhmm.trim();
+        int c = t.indexOf(':');
+        if (c <= 0 || c + 1 >= t.length()) {
+            return -1;
+        }
+        String rest = t.substring(c + 1).trim();
+        int c2 = rest.indexOf(':');
+        if (c2 >= 0) {
+            rest = rest.substring(0, c2).trim();
+        }
+        try {
+            int h = Integer.parseInt(t.substring(0, c).trim());
+            int m = Integer.parseInt(rest);
+            if (h < 0 || h > 23 || m < 0 || m > 59) {
+                return -1;
+            }
+            return h * 60 + m;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** Pure. 记录的结束时刻（毫秒）；解析不出来返回 -1。 */
+    static long endAtMillis(String date, String end) {
+        if (date == null || end == null) {
+            return -1;
+        }
+        String t = end.trim();
+        if (t.length() == 5) {
+            t = t + ":00";
+        }
+        try {
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                    .parse(date.trim() + " " + t).getTime();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** Pure. 服务端的 token 失效码（探活与状态查询共用同一套判定）。 */
+    static boolean tokenGone(JSONObject resp) {
+        if (resp == null || resp.optBoolean("status")) {
+            return false;
+        }
+        String s = resp.toString();
+        return s.contains("20003") || s.contains("20002");
+    }
+
+    /** Pure. 宽松解析 {code:200,data:[...]} 或 {status:true,data:[...]} 两种外壳。 */
+    static JSONArray dataList(JSONObject resp) {
+        if (resp == null) {
+            return null;
+        }
+        if (!resp.optBoolean("status") && resp.optInt("code", 0) != 200) {
+            return null;
+        }
+        Object d = resp.opt("data");
+        return d instanceof JSONArray ? (JSONArray) d : null;
+    }
+
+    /** Pure. 门禁记录的 direction：0=入馆，其余当离馆。 */
+    static boolean isLeave(String direction) {
+        if (direction == null) {
+            return false;
+        }
+        String s = direction.trim();
+        return "1".equals(s) || s.contains("离");
+    }
+
+    /** Pure. 宽松解析日期时间；只有时间时用 fallbackDate（yyyy-MM-dd）补日期。拿不到返回 -1。 */
+    static long parseDateTime(String s, String fallbackDate) {
+        if (s == null) {
+            return -1;
+        }
+        String t = s.trim().replace('T', ' ');
+        if (t.isEmpty()) {
+            return -1;
+        }
+        String full = t.indexOf(' ') > 0 ? t
+                : (fallbackDate == null ? null : fallbackDate.trim() + " " + t);
+        if (full == null) {
+            return -1;
+        }
+        String[] pats = {"yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm"};
+        for (String p : pats) {
+            try {
+                SimpleDateFormat f = new SimpleDateFormat(p, Locale.US);
+                f.setLenient(false);
+                return f.parse(full).getTime();
+            } catch (Exception ignored) {
+            }
+        }
+        return -1;
+    }
+
+    /** Pure. 从 awayRange 取暂离时刻；多段时取最后一段。拿不到返回 -1。 */
+    static long awayStartMillis(String awayRange, String date) {
+        if (awayRange == null) {
+            return -1;
+        }
+        String s = awayRange.trim();
+        // 同一天可能有多次暂离（"11:00~11:20,14:38~"）：只认最后一段
+        int comma = s.lastIndexOf(',');
+        if (comma >= 0) {
+            s = s.substring(comma + 1).trim();
+        }
+        int cut = s.indexOf('~');
+        if (cut < 0) {
+            cut = s.indexOf('_');
+        }
+        if (cut > 0) {
+            s = s.substring(0, cut);
+        }
+        return parseDateTime(s, date);
+    }
+
+    /** Pure. 拿不到离座时刻时的估算：观测时刻往前推一个巡检间隔（宁可早算，别晚算）。 */
+    static long fallbackSince(long observedMs) {
+        return observedMs - Scheduler.WATCH_EVERY_MIN * 60000L;
+    }
+
+    /** Pure. 登录态失效后多久再试：窗口内 30 分钟一次，出了窗口就收工。 */
+    static int stallDelayMin(int nowMin, int beginMinute, int endMinute) {
+        int d = nextTickDelayMin(nowMin, beginMinute, endMinute, false, -1, false);
+        return d < 0 ? -1 : Math.max(d, Scheduler.WATCH_RETRY_MIN);
+    }
+
+    /** Pure. 门禁记录里最后一次「离馆」的时刻（毫秒）；拿不到返回 -1。 */
+    static long lastLeaveIn(JSONObject resp, String date) {
+        JSONArray a = dataList(resp);
+        if (a == null) {
+            return -1;
+        }
+        long best = -1;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject r = a.optJSONObject(i);
+            if (r == null || !isLeave(firstStr(r, "direction", "directionStr", "inOut"))) {
+                continue;
+            }
+            long ts = parseDateTime(firstStr(r, "dateTimeStr", "dateTime", "time",
+                    "accessTime", "createDate"), date);
+            if (ts > best) {
+                best = ts;
+            }
+        }
+        return best;
+    }
+
+    /** 门禁记录里最后一次离馆时刻；网络失败返回 -1（只是兜底，失败不影响主流程）。 */
+    static long lastLeaveAt(String token, Net.Jar jar, String date, StringBuilder log) {
+        JSONObject r = post(DOOR_LOG + date, token, "{}", jar, log);
+        return lastLeaveIn(r, date);
+    }
+
+    /**
+     * Pure. 变更记录里最近一次「暂离」的时刻（毫秒）；拿不到返回 -1。
+     * /user/makeLife/{id} 的每项有 stage / stageName / createdDate，
+     * 这是服务端自己记的暂离时间，比门禁反推更准。
+     */
+    static long lastAwayIn(JSONObject resp, String date) {
+        JSONArray a = dataList(resp);
+        if (a == null) {
+            return -1;
+        }
+        long best = -1;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject r = a.optJSONObject(i);
+            if (r == null) {
+                continue;
+            }
+            String name = firstStr(r, "stageName");
+            String code = firstStr(r, "stage");
+            String up = code == null ? "" : code.toUpperCase(Locale.US);
+            boolean awayStage = "AWAY".equals(up)
+                    || (name != null && name.contains("暂离") && !"LEAVE_EARLY".equals(up));
+            if (!awayStage) {
+                continue;
+            }
+            long ts = parseDateTime(firstStr(r, "createdDate", "createTime", "date"), date);
+            if (ts > best) {
+                best = ts;
+            }
+        }
+        return best;
+    }
+
+    /** 变更记录里最近一次暂离时刻；拿不到返回 -1。 */
+    static long lastAwayAt(String token, Net.Jar jar, String id, String date, StringBuilder log) {
+        JSONObject r = post("/static/frontApi/user/makeLife/" + id, token, "{}", jar, log);
+        return lastAwayIn(r, date);
+    }
+
+    /**
+     * Pure. 这次暂离给多少宽限（分钟）。
+     * 图书馆的规矩：平时离座 1 小时，饭点（默认 11:00-13:30）2 小时，超时座位被释放。
+     */
+    static int graceMin(int awayMin, int mealStart, int mealEnd, int mealGrace, int normGrace) {
+        if (awayMin >= 0 && mealStart >= 0 && mealEnd > mealStart
+                && awayMin >= mealStart && awayMin < mealEnd) {
+            return mealGrace;
+        }
+        return normGrace;
+    }
+    /** 暂离后返回 —— 站点 PC 页面点「返回」走的就是这个接口。 */
+    static JSONObject checkIn(String token, Net.Jar jar, StringBuilder log) {
+        return post(CHECK_IN, token, "{}", jar, log);
+    }
+
+    /**
+     * Pure. 下一次巡检该等几分钟；-1 = 收工。
+     *
+     * 时段内有预约 → 每 5 分钟；暂离中 → 每 2 分钟（要盯着释放时间）；
+     * 时段开始前 → 睡到提前量；出了时段尾巴 → 停。
+     * 记录自己声明还没结束时（recordEndMin 有效）多盯到记录结束 + 30 分钟。
+     */
+    static int nextTickDelayMin(int nowMin, int beginMinute, int endMinute,
+                                boolean hasTodayBooking, int recordEndMin, boolean away) {
+        boolean hasWindow = beginMinute >= 0 && endMinute > beginMinute;
+        int winStart = hasWindow ? beginMinute - Scheduler.WATCH_LEAD_MIN : -1;
+        int limit = hasWindow ? endMinute + Scheduler.WATCH_TAIL_MIN : -1;
+        if (hasTodayBooking && recordEndMin >= 0) {
+            limit = Math.max(limit, recordEndMin + 30);
+        }
+        if (limit < 0) {
+            // 没配时段：只有"今天确实有预约"才值得盯
+            limit = hasTodayBooking ? 24 * 60 - 1 : -1;
+        }
+        if (limit < 0 || nowMin >= limit) {
+            return -1;
+        }
+        if (winStart >= 0 && nowMin < winStart) {
+            return winStart - nowMin;
+        }
+        int every = away ? Scheduler.WATCH_AWAY_MIN : Scheduler.WATCH_EVERY_MIN;
+        return Math.max(1, Math.min(every, limit - nowMin));
+    }
+
+    private static long nextAt(long nowMs, int nowMin, Cfg cfg, boolean todayBooking,
+                               int recordEndMin, boolean away) {
+        int delay = nextTickDelayMin(nowMin, cfg.ciBeginMinute, cfg.ciEndMinute,
+                todayBooking, recordEndMin, away);
+        return delay < 0 ? 0 : nowMs + delay * 60000L;
+    }
+
+    /**
+     * 登录态失效：守护暂时停摆。窗口内每 30 分钟自己再试一次（cookie 被前台刷新了就能自愈），
+     * 出了窗口就收工，等第二天重新武装。
+     */
+    private static Tick stall(Tick t, StringBuilder log, long nowMs, int nowMin, Cfg cfg, String line) {
+        t.notify = true;
+        t.kind = "stopped";
+        t.cancelAsk = true;
+        t.title = "守护暂时停了：登录态失效";
+        t.body = "座位 token 没了，7 天免登录也换不回来。\n打开 App 登录一次就能恢复；"
+                + "在那之前守护每 " + Scheduler.WATCH_RETRY_MIN + " 分钟自己再试一次。";
+        t.line = line;
+        t.detail = t.body + "\n\n—— 巡检日志 ——\n" + log;
+        int delay = stallDelayMin(nowMin, cfg.ciBeginMinute, cfg.ciEndMinute);
+        t.nextAt = delay < 0 ? 0 : nowMs + delay * 60000L;
+        return t;
+    }
+
+    static final int WATCH_BG = 0;       // 后台巡检：按策略问 / 催 / 到点替签
+    static final int WATCH_MANUAL = 1;   // 手动看一眼：只读，不改任何状态
+    static final int WATCH_REPAIR = 2;   // 用户在通知里点了「帮我签到」：立刻签
+
+    /**
+     * 巡检一次。暂离时的策略：
+     *   1 先问 —— 通知里给「帮我签到」/「不用，我自己回来」两个按钮；
+     *   2 没回应就每 10 分钟再问一次；
+     *   3 一直没回应 → 释放前 10 分钟替用户签（WATCH_REPAIR 是用户自己点的立刻签）。
+     * 只读 + 最多一次写，不并发、不重试风暴，跑在 WatchReceiver 的线程里。
+     */
+    static Tick watchTick(Context ctx, SecureStore sec, Cfg cfg, boolean foreground, int mode) {
+        Tick t = new Tick();
+        StringBuilder log = new StringBuilder();
+        long nowMs = System.currentTimeMillis();
+        int nowMin = minuteOfDay(new java.util.Date(nowMs));
+        String session = sec.get("session");
+        try {
+            Net.Jar jar = loadJar(sec);
+            primeJar(jar, foreground);
+            installSigner(session, jar, log);
+
+            String token = sessionToken(session);
+            if (token == null) {
+                token = ensureToken(ctx, sec, jar, session, log);
+            }
+            if (token == null) {
+                return stall(t, log, nowMs, nowMin, cfg, "登录态失效，守护暂停");
+            }
+            if (foreground) {
+                saveJar(sec, jar);
+            }
+
+            JSONObject resp = post(CUR_MAKE, token, "{}", jar, log);
+            if (resp == null || tokenGone(resp)) {
+                log.append("· token 可能已失效，换新后重试…\n");
+                token = ensureToken(ctx, sec, jar, session, log);
+                if (token == null) {
+                    return stall(t, log, nowMs, nowMin, cfg, "登录态失效，守护暂停");
+                }
+                saveJar(sec, jar);
+                resp = post(CUR_MAKE, token, "{}", jar, log);
+            }
+            if (resp == null) {
+                t.line = hhmm(nowMin) + " 查询失败（HTTP " + Net.lastHttp + "）";
+                t.detail = log.toString();
+                t.nextAt = nextAt(nowMs, nowMin, cfg, false, -1, false);
+                return t;
+            }
+
+            Now n = parseNow(resp);
+            t.ok = true;
+            log.append("· 状态: ").append(n.has ? stateText(n.state) : "没有有效预约").append('\n');
+            boolean todayBooking = n.has && (n.date == null || today().equals(n.date.trim()));
+            int recordEndMin = todayBooking ? minuteText(n.end) : -1;
+            boolean away = todayBooking && ST_AWAY.equals(n.state);
+
+            if (away) {
+                t.awayActive = true;
+                String key = n.id == null ? "" : n.id;
+                Away a = Away.load(ctx);
+                if (!key.equals(a.id)) {
+                    a = new Away();                       // 换了一条预约：重新开始
+                    a.id = key;
+                }
+                long since = a.since;
+                if (since <= 0) {
+                    since = awaySince(jar, n, token, log);
+                    if (since > 0) {
+                        a.since = since;                 // 只有真拿到才落盘，拿不到下一轮再找
+                    } else {
+                        since = fallbackSince(nowMs);    // 宁可早算，别晚算
+                        log.append("· 拿不到离座时刻，先按「第一次看到暂离再往前 ")
+                                .append(Scheduler.WATCH_EVERY_MIN).append(" 分钟」估算，下一轮继续找\n");
+                    }
+                }
+                int awayMin = minuteOfDay(new java.util.Date(since));
+                int grace = graceMin(awayMin, cfg.ciMealStartMin, cfg.ciMealEndMin,
+                        cfg.ciMealGraceMin, cfg.ciGraceMin);
+                long deadline = since + grace * 60000L;
+                long autoAt = deadline - Scheduler.AUTO_LEAD_MIN * 60000L;
+                long leftMin = Math.max(0, (deadline - nowMs + 59999L) / 60000L);
+                t.leftMin = leftMin;
+                log.append("· 离座 ").append(hhmm(awayMin)).append("，宽限 ").append(grace)
+                        .append(" 分钟 → 预计 ")
+                        .append(hhmm(minuteOfDay(new java.util.Date(deadline))))
+                        .append(" 释放（还剩约 ").append(leftMin).append(" 分钟）\n");
+
+                if (mode == WATCH_MANUAL) {
+                    t.kind = "away_peek";
+                    t.line = hhmm(nowMin) + " 暂离 · 距释放约 " + leftMin + " 分钟";
+                    log.append("· 手动查看：不改变任何状态\n");
+                } else if ("no".equals(a.decision) && mode != WATCH_REPAIR) {
+                    t.kind = "away_declined";
+                    t.line = hhmm(nowMin) + " 暂离（你选了不用）· 距释放约 " + leftMin + " 分钟";
+                } else {
+                    long recordEndMs = endAtMillis(n.date, n.end);
+                    boolean bookingOver = recordEndMs > 0 && nowMs > recordEndMs + 5 * 60000L;
+                    boolean userSaidYes = "yes".equals(a.decision);
+                    boolean lastResort = nowMs >= autoAt && !bookingOver;
+                    if (mode == WATCH_REPAIR || userSaidYes || lastResort) {
+                        boolean justTried = a.askedAt > 0
+                                && nowMs - a.askedAt < Scheduler.ASK_EVERY_MIN * 60000L;
+                        if (justTried && mode != WATCH_REPAIR) {
+                            t.kind = "away_yes";          // 刚试过，下一轮再重试
+                            t.line = hhmm(nowMin) + " 暂离（已点过帮我签到，等待重试）";
+                        } else {
+                            a.decision = "yes";
+                            a.askedAt = nowMs;
+                            t.cancelAsk = true;
+                            repair(sec, cfg, t, jar, token, n, log, nowMs, mode == WATCH_REPAIR);
+                        }
+                    } else {
+                        boolean due = a.askedAt <= 0
+                                || nowMs - a.askedAt >= Scheduler.ASK_EVERY_MIN * 60000L;
+                        if (due) {
+                            a.askedAt = nowMs;
+                            a.asked++;
+                            t.ask = true;
+                            t.notify = true;
+                            t.title = "座位暂离 · 要我帮你签到吗？";
+                            t.body = awayBody(n, since, grace, deadline, leftMin);
+                        }
+                        t.kind = "away_ask";
+                        t.line = hhmm(nowMin) + " 暂离 · 已提醒 " + a.asked + " 次 · 距释放约 "
+                                + leftMin + " 分钟";
+                    }
+                }
+                if (mode != WATCH_MANUAL) {
+                    a.save(ctx);
+                }
+            } else {
+                if (mode != WATCH_MANUAL) {
+                    Away.reset(ctx);
+                }
+                t.cancelAsk = true;
+                if (!n.has) {
+                    t.line = hhmm(nowMin) + " 没有有效预约";
+                } else {
+                    t.kind = "ok";
+                    t.line = hhmm(nowMin) + " " + stateText(n.state)
+                            + (n.seat == null ? "" : " " + n.seat);
+                }
+                if (mode == WATCH_REPAIR) {
+                    // 用户点了「帮我签到」，但此刻已经不在暂离（可能自己刷回来了）
+                    t.notify = true;
+                    t.kind = "repair_noop";
+                    t.title = "现在不用签到";
+                    t.body = n.has ? "当前状态：" + stateText(n.state) : "当前没有有效预约";
+                }
+            }
+            t.detail = n.text() + "\n\n—— 巡检日志 ——\n" + log;
+            t.nextAt = nextAt(nowMs, nowMin, cfg, todayBooking, recordEndMin, away);
+            return t;
+        } catch (Throwable e) {
+            t.line = "巡检异常：" + e;
+            t.detail = log + "\n" + e;
+            t.nextAt = nextAt(nowMs, nowMin, cfg, false, -1, false);
+            return t;
+        }
+    }
+
+    /**
+     * 这次暂离从什么时候开始，按可信度依次找：
+     * 记录里的 awayRange → 变更记录(makeLife) → 门禁最后一次离馆。
+     * 都拿不到返回 -1，由调用方按「观测时刻往前推」兜底（下一轮还会再找）。
+     */
+    private static long awaySince(Net.Jar jar, Now n, String token, StringBuilder log) {
+        String date = n.date == null ? today() : n.date;
+        long best = awayStartMillis(n.awayRange, date);
+        String src = best > 0 ? "记录 awayRange" : null;
+        if (best < 0 && n.id != null) {
+            long life = lastAwayAt(token, jar, n.id, date, log);
+            if (life > 0) {
+                best = life;
+                src = "变更记录";
+            }
+        }
+        if (best < 0) {
+            long door = lastLeaveAt(token, jar, date, log);
+            if (door > 0) {
+                best = door;
+                src = "门禁记录";
+            }
+        }
+        if (best > 0) {
+            log.append("· 离座 ").append(hhmm(minuteOfDay(new java.util.Date(best))))
+                    .append("（来源：").append(src).append("）\n");
+        }
+        return best;
+    }
+
+    /** 真的调一次「返回」并复查；试运行开着时只记录。 */
+    private static void repair(SecureStore sec, Cfg cfg, Tick t, Net.Jar jar, String token,
+                               Now n, StringBuilder log, long nowMs, boolean byUser) {
+        String at = hhmm(minuteOfDay(new java.util.Date(nowMs)));
+        if (cfg.ciDry) {
+            t.notify = true;
+            t.kind = "away_dry";
+            t.title = "发现暂离（试运行，未调返回）";
+            t.body = n.text() + "\n\n试运行开着：只记录，没有真的调返回接口。";
+            t.line = at + " 暂离（试运行，未调返回）";
+            log.append("· 试运行开着：没有真的调返回接口\n");
+            return;
+        }
+        log.append(byUser ? "· 你在通知里点了「帮我签到」，调返回接口…\n"
+                : "· 临近释放，替用户调返回接口…\n");
+        JSONObject r = checkIn(token, jar, log);
+        boolean fixed = r != null && r.optBoolean("status");
+        saveJar(sec, jar);
+        t.notify = true;
+        if (fixed) {
+            Now after = parseNow(post(CUR_MAKE, token, "{}", jar, null));
+            t.kind = "away_fixed";
+            t.title = "已帮你签到：暂离 → "
+                    + (after.has ? stateText(after.state) : "复查已无有效预约");
+            t.body = n.text() + "\n\n闸机漏记了入馆才会这样；如果经常发生，记得找回馆门禁补刷一次。";
+            t.line = at + " 暂离 → 已签到";
+        } else {
+            String m = r == null ? "请求没拿到有效响应" : r.optString("message");
+            t.kind = "away_failed";
+            t.title = "签到失败";
+            t.body = "服务端拒绝：" + m + "\n" + n.text();
+            t.line = at + " 暂离 → 签到失败：" + m;
+        }
+    }
+
+    private static String awayBody(Now n, long since, int grace, long deadline, long leftMin) {
+        StringBuilder b = new StringBuilder();
+        b.append(hhmm(minuteOfDay(new java.util.Date(since)))).append(" 离座 · 宽限 ")
+                .append(grace).append(" 分钟\n预计 ")
+                .append(hhmm(minuteOfDay(new java.util.Date(deadline))))
+                .append(" 释放（还剩约 ").append(leftMin).append(" 分钟）\n\n")
+                .append("点「帮我签到」= 现在就替你签\n")
+                .append("点「不用」= 不再打扰，也不自动签\n")
+                .append("不回应 = 每 ").append(Scheduler.ASK_EVERY_MIN).append(" 分钟提醒一次，")
+                .append("释放前 ").append(Scheduler.AUTO_LEAD_MIN).append(" 分钟自动替你签\n\n");
+        if (n.seat != null) {
+            b.append("座位 ").append(n.seat).append(" · ");
+        }
+        if (n.place != null) {
+            b.append(n.place.replace('|', ' ').trim());
+        }
+        return b.toString();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 手动签到：点一下就签                                                  */
+    /* ------------------------------------------------------------------ */
+
+    static final int SIGN_NONE = 0;   // 没有有效预约
+    static final int SIGN_DONE = 1;   // 已经履约中，不用签
+    static final int SIGN_DEAD = 2;   // 记录已经结束（早退/已结束/未签退/失约/已取消）
+    static final int SIGN_GO = 3;     // 值得调一次签到接口
+
+    /** Pure. 手动点「立即签到」时，这个状态要不要真的调接口。 */
+    static int signPlan(Now n) {
+        if (n == null || !n.has) {
+            return SIGN_NONE;
+        }
+        String s = n.state == null ? "" : n.state.trim().toUpperCase(Locale.US);
+        if ("CHECK_IN".equals(s)) {
+            return SIGN_DONE;
+        }
+        if ("LEAVE_EARLY".equals(s) || "STOP".equals(s) || "NO_STOP".equals(s)
+                || "MISS".equals(s) || "CANCEL".equals(s)) {
+            return SIGN_DEAD;
+        }
+        return SIGN_GO;   // RESERVE / AWAY / 没见过的状态：试一次，以服务端返回为准
+    }
+
+    /** 一次手动签到的结果：给「立即签到」的对话框用。 */
+    static final class Sign {
+        boolean ok;        // 这一下做成了（或本来就不需要做）
+        String title = "立即签到";
+        String body = "";
+        String line = "";  // 一行摘要，写回 ci_last
+        String detail = "";
+    }
+
+    /**
+     * 手动签到：把当前有效预约立刻签掉。已经履约中 / 记录已结束 / 没有有效预约
+     * 就不调接口，只如实报告；其余（暂离、预约未签到、没见过的状态）都试一次，
+     * 以服务端返回为准。用户自己点的这条路不看守护开关与试运行，且只调一次、不重试。
+     */
+    static Sign signNow(Context ctx, SecureStore sec, boolean foreground) {
+        Sign s = new Sign();
+        StringBuilder log = new StringBuilder();
+        String at = hhmm(minuteOfDay(new java.util.Date()));
+        try {
+            Net.Jar jar = loadJar(sec);
+            primeJar(jar, foreground);
+            String session = sec.get("session");
+            installSigner(session, jar, log);
+
+            String token = sessionToken(session);
+            if (token == null) {
+                token = ensureToken(ctx, sec, jar, session, log);
+            }
+            if (token != null && foreground) {
+                saveJar(sec, jar);
+            }
+
+            JSONObject resp = token == null ? null : post(CUR_MAKE, token, "{}", jar, log);
+            if (token != null && (resp == null || tokenGone(resp))) {
+                log.append("· token 可能已失效，换新后重试…\n");
+                token = ensureToken(ctx, sec, jar, session, log);
+                if (token != null) {
+                    saveJar(sec, jar);
+                    resp = post(CUR_MAKE, token, "{}", jar, log);
+                }
+            }
+            if (token == null) {
+                s.title = "读不到登录态";
+                s.body = "先在页面里登录一次（7 天免登录也换不回 token）。";
+            } else if (resp == null) {
+                s.title = "查询失败";
+                s.body = "拿不到当前预约状态（HTTP " + Net.lastHttp + "）。";
+            } else {
+                Now n = parseNow(resp);
+                int plan = signPlan(n);
+                log.append("· 点之前: ").append(n.has ? stateText(n.state) : "没有有效预约").append('\n');
+
+                if (plan == SIGN_NONE) {
+                    s.ok = true;
+                    s.title = "此刻没有要签的预约";
+                    s.body = "服务端说此刻没有有效预约 —— 没有可签的。\n"
+                            + "（刚下单的话，过一分钟再点一次。）";
+                    s.line = at + " 手动签到：没有有效预约";
+                } else if (plan == SIGN_DONE) {
+                    s.ok = true;
+                    s.title = "已经是履约中（已签到）";
+                    s.body = "没有重复调接口。\n\n" + n.text();
+                    s.line = at + " 手动签到：已经签过了";
+                } else if (plan == SIGN_DEAD) {
+                    s.title = "记录已经结束（" + stateText(n.state) + "）";
+                    s.body = "签到接口对它没有意义，没调。\n\n" + n.text();
+                    s.line = at + " 手动签到：记录已结束（" + stateText(n.state) + "）";
+                } else {
+                    String before = stateText(n.state);
+                    log.append("· 调签到接口（qrMd5=PC）…\n");
+                    JSONObject r = checkIn(token, jar, log);
+                    saveJar(sec, jar);
+                    if (r != null && r.optBoolean("status")) {
+                        Now after = parseNow(post(CUR_MAKE, token, "{}", jar, null));
+                        String to = after.has ? stateText(after.state) : "复查已无有效预约";
+                        s.ok = true;
+                        s.title = "已签到：" + before + " → " + to;
+                        s.body = n.text() + "\n\n服务端已受理，复查：" + to + "\n";
+                        s.line = at + " 手动签到：" + before + " → " + to;
+                    } else {
+                        String m = r == null ? "请求没拿到有效响应" : r.optString("message");
+                        s.title = "签到失败";
+                        s.body = "服务端拒绝：" + m + "\n\n" + n.text();
+                        s.line = at + " 手动签到失败：" + m;
+                        log.append("· 签到被拒: ").append(m).append('\n');
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            s.title = "签到异常";
+            s.body = String.valueOf(e);
+            log.append("· 异常: ").append(e).append('\n');
+        }
+        if (s.line.isEmpty()) {
+            s.line = at + " 手动签到失败：" + s.title;
+        }
+        s.detail = s.body + "\n\n" + state(sec) + "—— 日志 ——\n" + log;
+        return s;
     }
 
     /* ------------------------------------------------------------------ */

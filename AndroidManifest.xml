@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
@@ -42,6 +44,24 @@
         <receiver
             android:name=".CancelReceiver"
             android:exported="false" />
+
+        <receiver
+            android:name=".WatchReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".CheckInReceiver"
+            android:exported="false" />
+
+        <provider
+            android:name=".QuickFileProvider"
+            android:authorities="com.zwlib.quick.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <receiver
             android:name=".BootReceiver"

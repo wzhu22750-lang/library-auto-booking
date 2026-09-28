@@ -50,6 +50,11 @@ public class AutoBookReceiver extends BroadcastReceiver {
                     Scheduler.apply(app);
                 } catch (Throwable ignored) {
                 }
+                // 今天/明天的守护时段也跟着排一次（守护开着才有用）
+                try {
+                    Scheduler.armWatchByCfg(app);
+                } catch (Throwable ignored) {
+                }
                 pr.finish();
             }
         }, "zw-autobook").start();

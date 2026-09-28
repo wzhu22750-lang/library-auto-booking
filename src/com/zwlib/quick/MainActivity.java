@@ -1,5 +1,6 @@
 package com.zwlib.quick;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -21,6 +22,7 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.graphics.Typeface;
+import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.os.Bundle;
 import android.os.Environment;
@@ -28,6 +30,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
 import android.util.Log;
+import java.io.File;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -88,6 +91,8 @@ public class MainActivity extends Activity {
             + "?redirectUrl=https://zwlib.ruc.edu.cn/jsq-v";
     private static final String HOST_SUFFIX = "ruc.edu.cn";
 
+    private static final int REQUEST_FILE_CHOOSER = 1001;
+    private static final int REQUEST_CAMERA_PERMISSION = 1002;
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     private WebView web;
@@ -108,7 +113,12 @@ public class MainActivity extends Activity {
     private String pendingUser;           // memory only, until the user opted in
     private String pendingPass;
     private long lastBackPress;
+    private volatile boolean signing;     // 手动签到在跑：连点不重复调接口
     private ValueCallback<Uri[]> fileCallback;
+    private Uri cameraImageUri;
+    private PermissionRequest pendingWebPermissionRequest;
+    private AlertDialog controlCenterDialog;
+    private AlertDialog checkInDialog;
     private AlertDialog bookDialog;
     private AlertDialog lastDialog;
 
@@ -171,6 +181,10 @@ public class MainActivity extends Activity {
         maybeAskConsent();
         try {
             Scheduler.apply(this);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Scheduler.armWatchByCfg(this);
         } catch (Throwable ignored) {
         }
     }
@@ -692,74 +706,651 @@ public class MainActivity extends Activity {
     }
 
     private void showOptions(View anchor) {
-        PopupMenu m = new PopupMenu(this, anchor);
-        m.getMenu().add(0, 0, 0, autoOn() ? "自动登录：已开启" : "自动登录：已关闭");
-        m.getMenu().add(0, 1, 1, "清除已保存的账号密码");
-        Booker.Cfg cfg = Booker.Cfg.load(this);
-        m.getMenu().add(0, 2, 2, "定时预约：" + (cfg.enabled
-                ? cfg.timeText() + (cfg.dryRun ? "（试运行）" : "") : "未开启"));
-        m.getMenu().add(0, 3, 3, "立即演练一次（不会下单）");
-        m.getMenu().add(0, 4, 4, "检查登录状态（看页面停在哪儿）");
-        m.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
+        withFreshSession(new Runnable() {
             @Override
-            public boolean onMenuItemClick(android.view.MenuItem item) {
-                switch (item.getItemId()) {
-                    case 0: {
-                        boolean on = !autoOn();
-                        prefs.edit().putBoolean("auto", on).apply();
-                        if (!on) {
-                            sec.remove("user");
-                            sec.remove("pass");
-                            sec.remove("session");
-                            seedJson = null;
-                        }
-                        Toast.makeText(MainActivity.this,
-                                on ? "已开启，下次登录会记住密码" : "已关闭并清除已保存信息",
-                                Toast.LENGTH_SHORT).show();
-                        break;
-                    }
-                    case 1:
-                        sec.remove("user");
-                        sec.remove("pass");
-                        sec.remove("session");
-                        seedJson = null;
-                        pendingUser = null;
-                        pendingPass = null;
-                        Toast.makeText(MainActivity.this, "已清除本机保存的信息", Toast.LENGTH_SHORT).show();
-                        break;
-                    case 2:
-                        withFreshSession(new Runnable() {
-                            @Override
-                            public void run() {
-                                showBookDialog();
-                            }
-                        });
-                        break;
-                    case 3:
-                        withFreshSession(new Runnable() {
-                            @Override
-                            public void run() {
-                                runDryRun();
-                            }
-                        });
-                        break;
-                    case 4:
-                        withFreshSession(new Runnable() {
-                            @Override
-                            public void run() {
-                                checkLogin();
-                            }
-                        });
-                        break;
-                }
-                return true;
+            public void run() {
+                showControlCenter();
             }
         });
-        m.show();
+    }
+
+    private void showControlCenter() {
+        refreshControlCenter();
+    }
+
+    private void refreshControlCenter() {
+        if (controlCenterDialog != null) {
+            try {
+                controlCenterDialog.dismiss();
+            } catch (Throwable ignored) {
+            }
+            controlCenterDialog = null;
+        }
+
+        final Booker.Cfg cfg = Booker.Cfg.load(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(16);
+        box.setPadding(p, dp(14), p, dp(16));
+
+        // 1. 顶部 Header：标题 + 登录态指示药丸
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(4), dp(4), dp(4), dp(12));
+
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+        TextView hTitle = new TextView(this);
+        hTitle.setText("功能控制中心");
+        hTitle.setTextSize(20f);
+        hTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        hTitle.setTextColor(0xFF1A1A1A);
+        titleCol.addView(hTitle);
+
+        TextView hSub = new TextView(this);
+        hSub.setText("人大图书馆座位助手");
+        hSub.setTextSize(12f);
+        hSub.setTextColor(0xFF8A8A8E);
+        hSub.setPadding(0, dp(2), 0, 0);
+        titleCol.addView(hSub);
+        header.addView(titleCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final boolean hasSession = sec.get("session") != null;
+        TextView statusPill = buildBadgeView(hasSession ? "● 已登录" : "○ 未登录",
+                hasSession ? 0xFFE3F5EA : 0xFFECECEE,
+                hasSession ? 0xFF12683C : 0xFF8A8A8E);
+        statusPill.setClickable(true);
+        statusPill.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                withFreshSession(new Runnable() {
+                    @Override
+                    public void run() {
+                        checkLogin();
+                    }
+                });
+            }
+        });
+        header.addView(statusPill);
+        box.addView(header);
+
+        // 2. 核心模块一：【入馆签到 & 座位守护】（重点单列！）
+        String lastWatch = sec.get("ci_last");
+        String signStateText;
+        int signStateBg;
+        int signStateFg;
+        if (lastWatch != null && (lastWatch.contains("履约中") || lastWatch.contains("CHECK_IN"))) {
+            signStateText = "履约中";
+            signStateBg = 0xFFE3F5EA;
+            signStateFg = 0xFF12683C;
+        } else if (lastWatch != null && (lastWatch.contains("暂离") || lastWatch.contains("AWAY"))) {
+            signStateText = "暂离中";
+            signStateBg = 0xFFFFF3D6;
+            signStateFg = 0xFF8A6D00;
+        } else if (lastWatch != null && (lastWatch.contains("未签到") || lastWatch.contains("RESERVE"))) {
+            signStateText = "未签到";
+            signStateBg = 0xFFFFEBEB;
+            signStateFg = 0xFFB00020;
+        } else {
+            signStateText = "待巡检";
+            signStateBg = 0xFFECECEE;
+            signStateFg = 0xFF8A8A8E;
+        }
+
+        LinearLayout cardCheckIn = new LinearLayout(this);
+        cardCheckIn.setOrientation(LinearLayout.VERTICAL);
+        cardCheckIn.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 16));
+        cardCheckIn.setElevation(dp(2));
+        cardCheckIn.setPadding(dp(16), dp(15), dp(16), dp(15));
+
+        LinearLayout ciHead = new LinearLayout(this);
+        ciHead.setOrientation(LinearLayout.HORIZONTAL);
+        ciHead.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView ciTitle = new TextView(this);
+        ciTitle.setText("📌 入馆签到 & 座位守护");
+        ciTitle.setTextSize(16f);
+        ciTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        ciTitle.setTextColor(0xFF1A1A1A);
+        ciHead.addView(ciTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView ciBadge = buildBadgeView(signStateText, signStateBg, signStateFg);
+        ciHead.addView(ciBadge);
+        cardCheckIn.addView(ciHead);
+
+        TextView ciDesc = new TextView(this);
+        ciDesc.setTextSize(13f);
+        ciDesc.setTextColor(0xFF4A4A4A);
+        ciDesc.setPadding(0, dp(8), 0, 0);
+        ciDesc.setText(lastWatch != null && !lastWatch.isEmpty()
+                ? lastWatch
+                : "尚未巡检，进馆若漏刷闸机可直接点「立即签到」补签");
+        cardCheckIn.addView(ciDesc);
+
+        TextView ciTip = new TextView(this);
+        ciTip.setTextSize(12f);
+        ciTip.setPadding(0, dp(4), 0, dp(12));
+        if (cfg.ciEnabled) {
+            ciTip.setTextColor(0xFF12683C);
+            ciTip.setText("● 自动签到守护中 · " + cfg.ciWindowText()
+                    + (cfg.ciDry ? "（试运行只提醒）" : "（每 5 分钟巡检）"));
+        } else {
+            ciTip.setTextColor(0xFF8A8A8E);
+            ciTip.setText("○ 自动签到未开启（每天 " + cfg.ciWindowText() + "）");
+        }
+        cardCheckIn.addView(ciTip);
+
+        // 签到卡片底部双按钮
+        LinearLayout ciBtnRow = new LinearLayout(this);
+        ciBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView btnSignNow = buildButton("⚡ 立即签到", 0xFF8C1B22, 0xFFFFFFFF, true, new Runnable() {
+            @Override
+            public void run() {
+                signNow();
+            }
+        });
+        LinearLayout.LayoutParams lpBtnSign = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f);
+        lpBtnSign.rightMargin = dp(8);
+        ciBtnRow.addView(btnSignNow, lpBtnSign);
+
+        TextView btnCiDetail = buildButton("守护管理 ›", 0x148C1B22, 0xFF8C1B22, true, new Runnable() {
+            @Override
+            public void run() {
+                showCheckInDialog();
+            }
+        });
+        LinearLayout.LayoutParams lpBtnCiDetail = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        ciBtnRow.addView(btnCiDetail, lpBtnCiDetail);
+
+        cardCheckIn.addView(ciBtnRow);
+
+        LinearLayout.LayoutParams lpCardCi = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpCardCi.topMargin = dp(4);
+        box.addView(cardCheckIn, lpCardCi);
+
+        // 3. 核心模块二：【定时预约】
+        LinearLayout cardBook = new LinearLayout(this);
+        cardBook.setOrientation(LinearLayout.VERTICAL);
+        cardBook.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 16));
+        cardBook.setElevation(dp(2));
+        cardBook.setPadding(dp(16), dp(15), dp(16), dp(15));
+
+        LinearLayout bkHead = new LinearLayout(this);
+        bkHead.setOrientation(LinearLayout.HORIZONTAL);
+        bkHead.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView bkTitle = new TextView(this);
+        bkTitle.setText("⏰ 定时自动预约");
+        bkTitle.setTextSize(16f);
+        bkTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        bkTitle.setTextColor(0xFF1A1A1A);
+        bkHead.addView(bkTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        String bkBadgeText;
+        int bkBadgeBg;
+        int bkBadgeFg;
+        if (cfg.enabled) {
+            if (cfg.dryRun) {
+                bkBadgeText = "试运行 · " + cfg.timeText();
+                bkBadgeBg = 0xFFFFF3D6;
+                bkBadgeFg = 0xFF8A6D00;
+            } else {
+                bkBadgeText = "已开启 · " + cfg.timeText();
+                bkBadgeBg = 0xFFE3F5EA;
+                bkBadgeFg = 0xFF12683C;
+            }
+        } else {
+            bkBadgeText = "未开启";
+            bkBadgeBg = 0xFFECECEE;
+            bkBadgeFg = 0xFF8A8A8E;
+        }
+        TextView bkBadge = buildBadgeView(bkBadgeText, bkBadgeBg, bkBadgeFg);
+        bkHead.addView(bkBadge);
+        cardBook.addView(bkHead);
+
+        String venue = cfg.venueName == null || cfg.venueName.isEmpty() ? "未设置馆" : cfg.venueName;
+        String area = cfg.roomName == null || cfg.roomName.isEmpty() ? "自动选区" : cfg.roomName;
+        String dateTxt = cfg.dateLabel == null || cfg.dateLabel.isEmpty()
+                ? (cfg.dateOffset == 0 ? "今天" : cfg.dateOffset + " 天后") : cfg.dateLabel;
+        String seats = cfg.seatPriority == null || cfg.seatPriority.isEmpty()
+                ? "座位自动" : "座位 " + cfg.seatPriority;
+
+        TextView bkLine1 = new TextView(this);
+        bkLine1.setTextSize(13f);
+        bkLine1.setTextColor(0xFF4A4A4A);
+        bkLine1.setPadding(0, dp(8), 0, 0);
+        bkLine1.setText(venue + "  ·  " + area);
+        cardBook.addView(bkLine1);
+
+        TextView bkLine2 = new TextView(this);
+        bkLine2.setTextSize(12f);
+        bkLine2.setTextColor(0xFF8A8A8E);
+        bkLine2.setPadding(0, dp(3), 0, dp(12));
+        bkLine2.setText(dateTxt + "  ·  " + cfg.windowText() + "  ·  " + seats);
+        cardBook.addView(bkLine2);
+
+        // 预约卡片底部双按钮
+        LinearLayout bkBtnRow = new LinearLayout(this);
+        bkBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView btnBkToggle = buildButton(
+                cfg.enabled ? "停用预约" : "开启预约",
+                cfg.enabled ? 0xFFECECEE : 0xFF8C1B22,
+                cfg.enabled ? 0xFF6B6B70 : 0xFFFFFFFF,
+                true, new Runnable() {
+            @Override
+            public void run() {
+                if (!cfg.enabled) {
+                    if (!cfg.hasWindow()) {
+                        Toast.makeText(MainActivity.this, "先设时间段（请点预约配置）", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    if (cfg.venueId == null || cfg.venueId.isEmpty()) {
+                        Toast.makeText(MainActivity.this, "先选馆（请点预约配置）", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    cfg.enabled = true;
+                    cfg.save(MainActivity.this);
+                    Scheduler.apply(MainActivity.this);
+                    askNotifPermission();
+                    Toast.makeText(MainActivity.this, "已启用：每天 " + cfg.timeText() + " 自动预约", Toast.LENGTH_SHORT).show();
+                } else {
+                    cfg.enabled = false;
+                    cfg.save(MainActivity.this);
+                    Scheduler.cancel(MainActivity.this);
+                    Toast.makeText(MainActivity.this, "已停用定时预约", Toast.LENGTH_SHORT).show();
+                }
+                refreshControlCenter();
+            }
+        });
+        LinearLayout.LayoutParams lpBtnBkToggle = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+        lpBtnBkToggle.rightMargin = dp(8);
+        bkBtnRow.addView(btnBkToggle, lpBtnBkToggle);
+
+        TextView btnBkDetail = buildButton("预约配置 ›", 0xFFF2F2F4, 0xFF1A1A1A, true, new Runnable() {
+            @Override
+            public void run() {
+                withFreshSession(new Runnable() {
+                    @Override
+                    public void run() {
+                        showBookDialog();
+                    }
+                });
+            }
+        });
+        LinearLayout.LayoutParams lpBtnBkDetail = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f);
+        bkBtnRow.addView(btnBkDetail, lpBtnBkDetail);
+
+        cardBook.addView(bkBtnRow);
+
+        LinearLayout.LayoutParams lpCardBk = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpCardBk.topMargin = dp(12);
+        box.addView(cardBook, lpCardBk);
+
+        // 4. 快捷工具与系统
+        addSection(box, "快捷工具与系统");
+
+        addItem(box, "自动登录", autoOn() ? "已开启 ✓（记住密码与 Token）" : "已关闭", new Runnable() {
+            @Override
+            public void run() {
+                boolean on = !autoOn();
+                prefs.edit().putBoolean("auto", on).apply();
+                if (!on) {
+                    sec.remove("user");
+                    sec.remove("pass");
+                    sec.remove("session");
+                    seedJson = null;
+                }
+                Toast.makeText(MainActivity.this,
+                        on ? "已开启，下次登录会记住密码" : "已关闭并清除已保存信息",
+                        Toast.LENGTH_SHORT).show();
+                refreshControlCenter();
+            }
+        });
+
+        addItem(box, "立刻巡检当前座位", "查询服务端最新在馆与预约状态记录", new Runnable() {
+            @Override
+            public void run() {
+                checkSeatNow();
+            }
+        });
+
+        addItem(box, "预约流程演练（不下单）", "跑通完整选座与预约全流程，验证可用性", new Runnable() {
+            @Override
+            public void run() {
+                withFreshSession(new Runnable() {
+                    @Override
+                    public void run() {
+                        runDryRun();
+                    }
+                });
+            }
+        });
+
+        addItem(box, "检查风控状态", "看此刻预约接口是否需要滑块/验证码", new Runnable() {
+            @Override
+            public void run() {
+                withFreshSession(new Runnable() {
+                    @Override
+                    public void run() {
+                        checkRisk();
+                    }
+                });
+            }
+        });
+
+        addItem(box, "后台可靠性与权限",
+                (!Scheduler.ignoringBatteryOptimizations(this) || !Scheduler.canExactAlarm(this))
+                        ? "⚠ 权限不全，点此检查" : "省电白名单 & 精确闹钟权限正常 ✓",
+                new Runnable() {
+            @Override
+            public void run() {
+                showReliabilityDialog();
+            }
+        });
+
+        addItem(box, "清除已保存信息", "清除本机保存的账号密码与会话快照", new Runnable() {
+            @Override
+            public void run() {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("清除保存信息")
+                        .setMessage("确定要清除本机保存的学号、密码和 Session 快照吗？下次需要重新登录。")
+                        .setPositiveButton("确定清除", new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface d, int which) {
+                                sec.remove("user");
+                                sec.remove("pass");
+                                sec.remove("session");
+                                seedJson = null;
+                                pendingUser = null;
+                                pendingPass = null;
+                                Toast.makeText(MainActivity.this, "已清除本机保存的信息", Toast.LENGTH_SHORT).show();
+                                refreshControlCenter();
+                            }
+                        })
+                        .setNegativeButton("取消", null)
+                        .show();
+            }
+        });
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        controlCenterDialog = new AlertDialog.Builder(this)
+                .setView(sv)
+                .setNegativeButton("关闭", null)
+                .create();
+        controlCenterDialog.show();
+        if (controlCenterDialog.getWindow() != null) {
+            controlCenterDialog.getWindow().setBackgroundDrawable(cardBg(0xFFF4F4F6, 0x00000000, 22));
+        }
     }
 
     /* ------------------------------------------------------------------ */
-    /* 定时预约                                                            */
+    /* 座位守护与签到（单列专属面板）                                     */
+    /* ------------------------------------------------------------------ */
+
+    private void showCheckInDialog() {
+        refreshCheckInDialog();
+    }
+
+    private void refreshCheckInDialog() {
+        if (checkInDialog != null) {
+            try {
+                checkInDialog.dismiss();
+            } catch (Throwable ignored) {
+            }
+            checkInDialog = null;
+        }
+
+        final Booker.Cfg cfg = Booker.Cfg.load(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(20);
+        box.setPadding(p, dp(14), p, dp(16));
+
+        String lastWatch = sec.get("ci_last");
+        String bigStatusTitle;
+        int statusColor;
+        if (lastWatch != null && (lastWatch.contains("履约中") || lastWatch.contains("CHECK_IN"))) {
+            bigStatusTitle = "🟢 当前履约中（已签到）";
+            statusColor = 0xFF12683C;
+        } else if (lastWatch != null && (lastWatch.contains("暂离") || lastWatch.contains("AWAY"))) {
+            bigStatusTitle = "🟠 当前状态为「暂离」";
+            statusColor = 0xFF8A6D00;
+        } else if (lastWatch != null && (lastWatch.contains("未签到") || lastWatch.contains("RESERVE"))) {
+            bigStatusTitle = "🔴 已预约待签到";
+            statusColor = 0xFFB00020;
+        } else {
+            bigStatusTitle = "⚪ 暂无在座预约记录";
+            statusColor = 0xFF6B6B70;
+        }
+
+        // 顶部在馆状态大卡片
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 18));
+        card.setElevation(dp(2));
+        card.setPadding(dp(18), dp(16), dp(18), dp(16));
+
+        TextView big = new TextView(this);
+        big.setText(bigStatusTitle);
+        big.setTextSize(19f);
+        big.setTypeface(Typeface.DEFAULT_BOLD);
+        big.setTextColor(statusColor);
+        card.addView(big);
+
+        TextView l1 = new TextView(this);
+        l1.setTextSize(13.5f);
+        l1.setTextColor(0xFF4A4A4A);
+        l1.setPadding(0, dp(8), 0, 0);
+        l1.setText(lastWatch != null && !lastWatch.isEmpty()
+                ? lastWatch
+                : "尚未巡检（可点下方按钮立刻向服务端查询一次）");
+        card.addView(l1);
+
+        // 刷新状态按钮
+        LinearLayout refreshRow = new LinearLayout(this);
+        refreshRow.setOrientation(LinearLayout.HORIZONTAL);
+        refreshRow.setGravity(Gravity.END);
+        refreshRow.setPadding(0, dp(10), 0, 0);
+
+        TextView btnRefresh = buildButton("🔄 刷新在馆状态", 0x148C1B22, 0xFF8C1B22, true, new Runnable() {
+            @Override
+            public void run() {
+                checkSeatNow();
+            }
+        });
+        btnRefresh.setTextSize(12.5f);
+        btnRefresh.setPadding(dp(12), dp(6), dp(12), dp(6));
+        refreshRow.addView(btnRefresh);
+        card.addView(refreshRow);
+
+        box.addView(card, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 核心操作：立即签到大按钮
+        addPrimary(box, "立即签到（远程入馆）", 0xFF8C1B22, new Runnable() {
+            @Override
+            public void run() {
+                signNow();
+            }
+        });
+
+        TextView signTip = new TextView(this);
+        signTip.setTextSize(12f);
+        signTip.setTextColor(0xFF8A8A8E);
+        signTip.setPadding(dp(4), dp(6), dp(4), dp(4));
+        signTip.setText("人在座但闸机漏刷？或需要提前入馆？点此直接调用签到接口。点击即真签。");
+        box.addView(signTip);
+
+        // 分组：座位守护（暂离自动返回）
+        addSection(box, "座位守护（暂离自动返回）");
+
+        addItem(box, "暂离自动返回",
+                cfg.ciEnabled ? ("已开启 —— 每天 " + cfg.ciWindowText() + " 巡检") : "已关闭", new Runnable() {
+            @Override
+            public void run() {
+                if (!cfg.ciEnabled) {
+                    if (sec.get("session") == null) {
+                        Toast.makeText(MainActivity.this, "先回页面登录一次", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    cfg.ciEnabled = true;
+                    cfg.save(MainActivity.this);
+                    askNotifPermission();
+                    Scheduler.armWatchByCfg(MainActivity.this);
+                    Toast.makeText(MainActivity.this,
+                            "已开启自动签到守护：在守护时段（" + cfg.ciWindowText()
+                                    + "）内每 5 分钟查一次状态，发现「暂离」就自动调返回接口。"
+                                    + (cfg.ciDry ? "\n\n守护试运行还开着 —— 只记录，不会真的调。" : ""),
+                            Toast.LENGTH_LONG).show();
+                } else {
+                    cfg.ciEnabled = false;
+                    cfg.save(MainActivity.this);
+                    Scheduler.armWatch(MainActivity.this, 0);
+                    Toast.makeText(MainActivity.this, "已关闭守护", Toast.LENGTH_SHORT).show();
+                }
+                refreshCheckInDialog();
+            }
+        });
+
+        addItem(box, "守护时间段", cfg.ciWindowText(), new Runnable() {
+            @Override
+            public void run() {
+                new android.app.TimePickerDialog(MainActivity.this,
+                        new android.app.TimePickerDialog.OnTimeSetListener() {
+                            @Override
+                            public void onTimeSet(android.widget.TimePicker v, int h, int min) {
+                                cfg.ciBeginMinute = h * 60 + min;
+                                new android.app.TimePickerDialog(MainActivity.this,
+                                        new android.app.TimePickerDialog.OnTimeSetListener() {
+                                            @Override
+                                            public void onTimeSet(android.widget.TimePicker v2, int h2, int m2) {
+                                                if (h2 * 60 + m2 <= cfg.ciBeginMinute) {
+                                                    Toast.makeText(MainActivity.this, "结束时间必须晚于开始时间", Toast.LENGTH_LONG).show();
+                                                    return;
+                                                }
+                                                cfg.ciEndMinute = h2 * 60 + m2;
+                                                cfg.save(MainActivity.this);
+                                                if (cfg.ciEnabled) {
+                                                    Scheduler.armWatchByCfg(MainActivity.this);
+                                                }
+                                                refreshCheckInDialog();
+                                            }
+                                        }, cfg.ciEndMinute / 60, cfg.ciEndMinute % 60, true).show();
+                            }
+                        }, cfg.ciBeginMinute / 60, cfg.ciBeginMinute % 60, true).show();
+            }
+        });
+
+        addItem(box, "守护试运行", cfg.ciDry
+                        ? "已开启 —— 只记录不调接口" : "已关闭 —— 发现暂离会真的调返回",
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        cfg.ciDry = !cfg.ciDry;
+                        cfg.save(MainActivity.this);
+                        if (!cfg.ciDry) {
+                            Toast.makeText(MainActivity.this,
+                                    "已关闭守护试运行：巡检到「暂离」会真的调返回接口",
+                                    Toast.LENGTH_LONG).show();
+                        }
+                        refreshCheckInDialog();
+                    }
+                });
+
+        // 分组：暂离时限
+        addSection(box, "暂离时限（算「座位被释放」用）");
+
+        addItem(box, "平时暂离时限", cfg.ciGraceMin + " 分钟",
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        editMinutes(cfg, true);
+                    }
+                });
+
+        addItem(box, "饭点暂离时限", cfg.ciMealGraceMin + " 分钟",
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        editMinutes(cfg, false);
+                    }
+                });
+
+        addItem(box, "饭点时段", Booker.hhmm(cfg.ciMealStartMin) + " - "
+                + Booker.hhmm(cfg.ciMealEndMin), new Runnable() {
+            @Override
+            public void run() {
+                new android.app.TimePickerDialog(MainActivity.this,
+                        new android.app.TimePickerDialog.OnTimeSetListener() {
+                            @Override
+                            public void onTimeSet(android.widget.TimePicker v, int h, int min) {
+                                cfg.ciMealStartMin = h * 60 + min;
+                                new android.app.TimePickerDialog(MainActivity.this,
+                                        new android.app.TimePickerDialog.OnTimeSetListener() {
+                                            @Override
+                                            public void onTimeSet(android.widget.TimePicker v2,
+                                                                  int h2, int m2) {
+                                                cfg.ciMealEndMin = h2 * 60 + m2;
+                                                cfg.save(MainActivity.this);
+                                                refreshCheckInDialog();
+                                            }
+                                        }, cfg.ciMealEndMin / 60, cfg.ciMealEndMin % 60, true).show();
+                            }
+                        }, cfg.ciMealStartMin / 60, cfg.ciMealStartMin % 60, true).show();
+            }
+        });
+
+        // 分组：规则说明
+        addSection(box, "规则说明");
+
+        LinearLayout ruleCard = new LinearLayout(this);
+        ruleCard.setOrientation(LinearLayout.VERTICAL);
+        ruleCard.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 14));
+        ruleCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        TextView ruleText = new TextView(this);
+        ruleText.setTextSize(12.5f);
+        ruleText.setTextColor(0xFF6B6B70);
+        ruleText.setLineSpacing(dp(3), 1f);
+        ruleText.setText("• 图书馆规则：出馆闸机刷卡会记「暂离」；回馆若闸机漏刷，系统会一直记暂离直到时限耗尽释放座位并记早退违约。\n\n"
+                + "• 守护机制：在守护时段（独立设置，默认 07:00-22:30）内自动巡检，发现暂离先发通知询问，临近释放前 10 分钟自动调接口替你签到返回。\n\n"
+                + "• 人在座位上：若您人已在座，可随时点击上方的「立即签到」直接变为履约中。");
+        ruleCard.addView(ruleText);
+
+        LinearLayout.LayoutParams lpRule = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpRule.topMargin = dp(4);
+        box.addView(ruleCard, lpRule);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        checkInDialog = new AlertDialog.Builder(this)
+                .setTitle("座位守护与签到")
+                .setView(sv)
+                .setNegativeButton("关闭", null)
+                .setNeutralButton("返回控制中心", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        showControlCenter();
+                    }
+                })
+                .create();
+        checkInDialog.show();
+        if (checkInDialog.getWindow() != null) {
+            checkInDialog.getWindow().setBackgroundDrawable(cardBg(0xFFF4F4F6, 0x00000000, 22));
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* 定时预约（专属配置面板）                                           */
     /* ------------------------------------------------------------------ */
 
     private void askNotifPermission() {
@@ -767,6 +1358,19 @@ public class MainActivity extends Activity {
                 && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 77);
+        }
+    }
+
+    private boolean hasCameraPermission() {
+        if (Build.VERSION.SDK_INT >= 23) {
+            return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    private void requestCameraPermission(int requestCode) {
+        if (Build.VERSION.SDK_INT >= 23) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, requestCode);
         }
     }
 
@@ -786,7 +1390,7 @@ public class MainActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         int p = dp(20);
-        box.setPadding(p, dp(10), p, 0);
+        box.setPadding(p, dp(10), p, dp(16));
 
         String venue = cfg.venueName == null || cfg.venueName.isEmpty() ? "馆未设置" : cfg.venueName;
         String area = cfg.roomName == null || cfg.roomName.isEmpty() ? "自动选区" : cfg.roomName;
@@ -851,6 +1455,15 @@ public class MainActivity extends Activity {
             w2.setText("\u26a0 没进省电白名单：小米/华为/OPPO/vivo 可能到点直接拦掉。"
                     + "下面的「后台可靠性 → 省电白名单」开一下。");
             box.addView(w2);
+        }
+        if (!Scheduler.canExactAlarm(this)) {
+            TextView w3 = new TextView(this);
+            w3.setTextSize(13f);
+            w3.setTextColor(0xFFB00020);
+            w3.setPadding(dp(4), dp(12), dp(4), 0);
+            w3.setText("\u26a0 没给「闹钟和提醒」权限：定时预约和座位守护都可能晚几十分钟，"
+                    + "守护会赶不上释放前那一刻。下面的「后台可靠性 → 闹钟与提醒权限」开一下。");
+            box.addView(w3);
         }
 
         addPrimary(box, cfg.enabled ? "停用定时预约" : "启用定时预约",
@@ -961,7 +1574,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        addSection(box, "执行");
+        addSection(box, "执行与演练");
 
         addItem(box, "试运行（不下单）", cfg.dryRun ? "已开启 —— 只查询" : "已关闭 —— 会真预约",
                 new Runnable() {
@@ -976,7 +1589,6 @@ public class MainActivity extends Activity {
                         refreshBookDialog();
                     }
                 });
-
 
         addItem(box, "立即演练一次", "跑一遍完整流程，但不下单", new Runnable() {
             @Override
@@ -1000,6 +1612,14 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 askBatteryWhitelist();
+            }
+        });
+
+        addItem(box, "闹钟与提醒权限", Scheduler.canExactAlarm(this)
+                ? "已授权 ✓" : "未授权 —— 守护会迟到，点这里去开", new Runnable() {
+            @Override
+            public void run() {
+                askExactAlarmPermission();
             }
         });
 
@@ -1028,6 +1648,22 @@ public class MainActivity extends Activity {
             }
         });
 
+        // 底部提示卡片：签到已单列
+        LinearLayout tipCard = new LinearLayout(this);
+        tipCard.setOrientation(LinearLayout.VERTICAL);
+        tipCard.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 14));
+        tipCard.setPadding(dp(14), dp(12), dp(14), dp(12));
+        TextView tipText = new TextView(this);
+        tipText.setTextSize(12.5f);
+        tipText.setTextColor(0xFF6B6B70);
+        tipText.setText("💡 签到与座位守护已单列至专属面板，可从「控制中心 → 签到与守护」进入进行管理和远程签到。");
+        tipCard.addView(tipText);
+
+        LinearLayout.LayoutParams lpTip = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lpTip.topMargin = dp(14);
+        box.addView(tipCard, lpTip);
+
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
 
@@ -1035,11 +1671,104 @@ public class MainActivity extends Activity {
                 .setTitle("定时预约")
                 .setView(sv)
                 .setNegativeButton("关闭", null)
+                .setNeutralButton("返回控制中心", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        showControlCenter();
+                    }
+                })
                 .create();
         bookDialog.show();
         if (bookDialog.getWindow() != null) {
             bookDialog.getWindow().setBackgroundDrawable(cardBg(0xFFF4F4F6, 0x00000000, 22));
         }
+    }
+
+    private void showReliabilityDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(20);
+        box.setPadding(p, dp(10), p, dp(14));
+
+        addItem(box, "省电白名单", Scheduler.ignoringBatteryOptimizations(this)
+                ? "已加入 ✓" : "未加入 —— 点这里开启（准时唤醒必备）", new Runnable() {
+            @Override
+            public void run() {
+                askBatteryWhitelist();
+            }
+        });
+
+        addItem(box, "闹钟与提醒权限", Scheduler.canExactAlarm(this)
+                ? "已授权 ✓" : "未授权 —— 闹钟会迟到，点这里去开", new Runnable() {
+            @Override
+            public void run() {
+                askExactAlarmPermission();
+            }
+        });
+
+        addItem(box, "2 分钟后测试闹钟", "只查询不下单：验证到点会不会准时响", new Runnable() {
+            @Override
+            public void run() {
+                Booker.Cfg cfg = Booker.Cfg.load(MainActivity.this);
+                if (!cfg.enabled) {
+                    Toast.makeText(MainActivity.this,
+                            "先启用定时预约，测试才有意义（测的是闹钟链路）",
+                            Toast.LENGTH_LONG).show();
+                    return;
+                }
+                Scheduler.applyTest(MainActivity.this, 120);
+                Toast.makeText(MainActivity.this,
+                        "已排：2 分钟后响一次。可以锁屏/退到桌面，等通知。",
+                        Toast.LENGTH_LONG).show();
+            }
+        });
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+
+        new AlertDialog.Builder(this)
+                .setTitle("后台可靠性")
+                .setView(sv)
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private TextView buildBadgeView(String text, int bgColor, int fgColor) {
+        TextView b = new TextView(this);
+        b.setText(text);
+        b.setTextSize(11.5f);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(fgColor);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(bgColor);
+        bg.setCornerRadius(dp(20));
+        b.setBackground(bg);
+        b.setPadding(dp(10), dp(3), dp(10), dp(3));
+        return b;
+    }
+
+    private TextView buildButton(String text, int bgFill, int textColor, boolean bold, final Runnable action) {
+        TextView b = new TextView(this);
+        b.setText(text);
+        b.setTextSize(14f);
+        if (bold) {
+            b.setTypeface(Typeface.DEFAULT_BOLD);
+        }
+        b.setTextColor(textColor);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(12), dp(11), dp(12), dp(11));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(bgFill);
+        bg.setCornerRadius(dp(12));
+        b.setBackground(rippleOn(bg, (textColor == 0xFFFFFFFF ? 0x33FFFFFF : 0x148C1B22)));
+        b.setClickable(true);
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                action.run();
+            }
+        });
+        return b;
     }
 
     /** 分组小标题 */
@@ -1329,10 +2058,10 @@ public class MainActivity extends Activity {
                 .setMessage(body)
                 .setPositiveButton("知道了", null)
                 .setNeutralButton("复制日志", null)
-                .setNegativeButton("设置", new DialogInterface.OnClickListener() {
+                .setNegativeButton("控制中心", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int w) {
-                        refreshBookDialog();
+                        showControlCenter();
                     }
                 })
                 .create();
@@ -1497,6 +2226,31 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Android 12+ 可以收回精确闹钟权限；收回后守护只能按不精确闹钟跑，可能晚几十分钟。 */
+    private void askExactAlarmPermission() {
+        if (Scheduler.canExactAlarm(this)) {
+            Toast.makeText(this, "已经授权了", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (Build.VERSION.SDK_INT < 31) {
+            Toast.makeText(this, "这个版本不需要单独授权", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            startActivity(new Intent("android.settings.REQUEST_SCHEDULE_EXACT_ALARM",
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(
+                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Throwable t2) {
+                Toast.makeText(this, "请到 设置→应用→本应用→闹钟和提醒 里手动打开",
+                        Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
     private void checkRisk() {
         withSession(new SessionCb() {
             @Override
@@ -1520,6 +2274,123 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    /** 立刻巡检一次：只读，不改守护的任何状态；试运行开着就只记录不调接口。 */
+    private void checkSeatNow() {
+        Toast.makeText(this, "正在巡检…", Toast.LENGTH_SHORT).show();
+        final Booker.Cfg cfg = Booker.Cfg.load(this);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Booker.Tick t =
+                        Booker.watchTick(MainActivity.this, sec, cfg, true, Booker.WATCH_MANUAL);
+                sec.put("ci_last", t.line);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        showCopyable("签到状态", t.detail);
+                        if (checkInDialog != null && checkInDialog.isShowing()) {
+                            refreshCheckInDialog();
+                        }
+                        if (controlCenterDialog != null && controlCenterDialog.isShowing()) {
+                            refreshControlCenter();
+                        }
+                    }
+                });
+            }
+        }, "zw-watch-now").start();
+    }
+
+    /**
+     * 手动签到：点一下就把当前有效预约签掉（不走守护开关与试运行 —— 用户点了就是要真签）。
+     * 结果写回「签到状态」那一行；签成了就把过期的「要我帮你签到吗」通知撤掉。
+     */
+    private void signNow() {
+        if (signing) {
+            Toast.makeText(this, "上一次还在跑…", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        signing = true;
+        Toast.makeText(this, "正在签到…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final Booker.Sign s = Booker.signNow(MainActivity.this, sec, true);
+                    sec.put("ci_last", s.line);
+                    if (s.ok) {
+                        WatchReceiver.cancelAsk(MainActivity.this);
+                    }
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            showCopyable(s.title, s.detail);
+                            if (checkInDialog != null && checkInDialog.isShowing()) {
+                                refreshCheckInDialog();
+                            }
+                            if (controlCenterDialog != null && controlCenterDialog.isShowing()) {
+                                refreshControlCenter();
+                            }
+                        }
+                    });
+                } finally {
+                    signing = false;
+                }
+            }
+        }, "zw-sign-now").start();
+    }
+
+    /** 暂离时限（分钟）：平时 / 饭点。超时后座位会被释放。 */
+    private void editMinutes(final Booker.Cfg cfg, final boolean normal) {
+        final android.widget.EditText input = new android.widget.EditText(this);
+        input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        input.setText(String.valueOf(normal ? cfg.ciGraceMin : cfg.ciMealGraceMin));
+        input.setSelection(input.getText().length());
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(20);
+        box.setPadding(p, dp(8), p, 0);
+        TextView hint = new TextView(this);
+        hint.setTextSize(13f);
+        hint.setText(normal ? "平时离座多久算超时（分钟）。图书馆规矩是 60。"
+                : "饭点离座多久算超时（分钟）。图书馆规矩是 120。");
+        box.addView(hint);
+        box.addView(input);
+        new AlertDialog.Builder(this)
+                .setTitle(normal ? "平时暂离时限" : "饭点暂离时限")
+                .setView(box)
+                .setPositiveButton("保存", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        try {
+                            int m = Integer.parseInt(input.getText().toString().trim());
+                            if (m < 5 || m > 300) {
+                                Toast.makeText(MainActivity.this, "填 5~300 分钟",
+                                        Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            if (normal) {
+                                cfg.ciGraceMin = m;
+                            } else {
+                                cfg.ciMealGraceMin = m;
+                            }
+                            cfg.save(MainActivity.this);
+                        } catch (Exception e) {
+                            Toast.makeText(MainActivity.this, "数字看不懂", Toast.LENGTH_SHORT).show();
+                        }
+                        if (checkInDialog != null && checkInDialog.isShowing()) {
+                            refreshCheckInDialog();
+                        } else if (bookDialog != null && bookDialog.isShowing()) {
+                            refreshBookDialog();
+                        }
+                        if (controlCenterDialog != null && controlCenterDialog.isShowing()) {
+                            refreshControlCenter();
+                        }
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void editSeatPriority(final Booker.Cfg cfg) {
@@ -1916,9 +2787,21 @@ public class MainActivity extends Activity {
             }
 
             @Override
-            public void onPermissionRequest(PermissionRequest request) {
+            public void onPermissionRequest(final PermissionRequest request) {
                 if (Build.VERSION.SDK_INT >= 21) {
-                    request.grant(request.getResources());
+                    boolean needsCamera = false;
+                    for (String res : request.getResources()) {
+                        if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(res)) {
+                            needsCamera = true;
+                            break;
+                        }
+                    }
+                    if (needsCamera && !hasCameraPermission()) {
+                        pendingWebPermissionRequest = request;
+                        requestCameraPermission(REQUEST_CAMERA_PERMISSION);
+                    } else {
+                        request.grant(request.getResources());
+                    }
                 }
             }
 
@@ -1930,12 +2813,24 @@ public class MainActivity extends Activity {
                 }
                 fileCallback = callback;
                 try {
-                    Intent i = params.createIntent();
-                    i.addCategory(Intent.CATEGORY_OPENABLE);
-                    startActivityForResult(i, 1001);
+                    Intent chooserIntent = params.createIntent();
+                    chooserIntent.addCategory(Intent.CATEGORY_OPENABLE);
+
+                    Intent captureIntent = createCameraCaptureIntent();
+                    Intent targetIntent;
+                    if (captureIntent != null) {
+                        Intent[] extraIntents = new Intent[]{captureIntent};
+                        targetIntent = Intent.createChooser(chooserIntent, "选择或拍照");
+                        targetIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, extraIntents);
+                    } else {
+                        targetIntent = chooserIntent;
+                    }
+
+                    startActivityForResult(targetIntent, REQUEST_FILE_CHOOSER);
                     return true;
                 } catch (ActivityNotFoundException e) {
                     fileCallback = null;
+                    cameraImageUri = null;
                     return false;
                 }
             }
@@ -1996,28 +2891,72 @@ public class MainActivity extends Activity {
         }
     }
 
+    private Intent createCameraCaptureIntent() {
+        try {
+            Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            if (intent.resolveActivity(getPackageManager()) == null) {
+                return null;
+            }
+            File cacheDir = getExternalCacheDir();
+            if (cacheDir == null) {
+                cacheDir = getCacheDir();
+            }
+            File photoFile = new File(cacheDir, "upload_camera_" + System.currentTimeMillis() + ".jpg");
+            cameraImageUri = QuickFileProvider.getUriForFile(this, "com.zwlib.quick.fileprovider", photoFile);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, cameraImageUri);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            return intent;
+        } catch (Throwable t) {
+            cameraImageUri = null;
+            return null;
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode == 1001) {
+        if (requestCode == REQUEST_FILE_CHOOSER) {
             if (fileCallback != null) {
                 Uri[] results = null;
-                if (resultCode == RESULT_OK && data != null) {
-                    if (data.getClipData() != null) {
+                if (resultCode == RESULT_OK) {
+                    if (data != null && data.getData() != null) {
+                        results = new Uri[]{data.getData()};
+                    } else if (data != null && data.getClipData() != null) {
                         int n = data.getClipData().getItemCount();
                         results = new Uri[n];
                         for (int i = 0; i < n; i++) {
                             results[i] = data.getClipData().getItemAt(i).getUri();
                         }
-                    } else if (data.getData() != null) {
-                        results = new Uri[]{data.getData()};
+                    } else if (cameraImageUri != null) {
+                        results = new Uri[]{cameraImageUri};
                     }
                 }
                 fileCallback.onReceiveValue(results);
                 fileCallback = null;
+                cameraImageUri = null;
             }
             return;
         }
         super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            if (grantResults != null && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                if (pendingWebPermissionRequest != null && Build.VERSION.SDK_INT >= 21) {
+                    pendingWebPermissionRequest.grant(pendingWebPermissionRequest.getResources());
+                }
+            } else {
+                if (pendingWebPermissionRequest != null && Build.VERSION.SDK_INT >= 21) {
+                    pendingWebPermissionRequest.deny();
+                }
+                Toast.makeText(this, "相机权限被拒绝", Toast.LENGTH_SHORT).show();
+            }
+            pendingWebPermissionRequest = null;
+            return;
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 
     @Override

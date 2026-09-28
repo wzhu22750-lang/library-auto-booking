@@ -8,8 +8,13 @@ import android.content.Intent;
 public class BootReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
+        Context app = context.getApplicationContext();
         try {
-            Scheduler.apply(context.getApplicationContext());
+            Scheduler.apply(app);
+        } catch (Throwable ignored) {
+        }
+        try {
+            Scheduler.armWatchByCfg(app);
         } catch (Throwable ignored) {
         }
     }

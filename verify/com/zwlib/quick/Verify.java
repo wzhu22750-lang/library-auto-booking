@@ -58,6 +58,13 @@ public class Verify {
         }
     }
 
+    /** /user/currentUseMake 的一条记录，只关心 status。 */
+    static Booker.Now nowWith(String state) {
+        return Booker.parseNow(j("{\"status\":true,\"data\":{\"id\":\"1878649390807224320\","
+                + "\"status\":\"" + state + "\",\"makeDateStr\":\"2026-09-25\","
+                + "\"makeBeginStr\":\"10:00\",\"makeEndStr\":\"12:00\"}}"));
+    }
+
     static String fixture(String name) {
         try {
             String dir = System.getProperty("fixtures", "verify/fixtures");
@@ -81,6 +88,8 @@ public class Verify {
         freeSeatFiltering();
         seatPriority();
         datesAndFormat();
+        checkInWatch();
+        checkInIndependence();
 
         System.out.println("\n" + pass + " passed, " + fail + " failed");
         if (fail > 0) {
@@ -277,6 +286,29 @@ public class Verify {
         ok("结束等于开始时无效", !fresh.hasWindow());
     }
 
+    /* ---------------- 6e. 自动签到与定时预约完全独立 -------------------------- */
+    static void checkInIndependence() {
+        System.out.println("\n[6e] 自动签到与定时预约完全独立");
+        Booker.Cfg cfg = new Booker.Cfg();
+        ok("定时预约默认未配置时间段", !cfg.hasWindow());
+        ok("自动签到默认已有独立守护时段", cfg.hasCiWindow());
+        eq("自动签到默认时段文案", cfg.ciWindowText(), "07:00 - 22:30");
+
+        // 修改签到守护时段，预约时段不受任何影响
+        cfg.ciBeginMinute = 8 * 60;
+        cfg.ciEndMinute = 21 * 60;
+        ok("预约依然未设置", !cfg.hasWindow());
+        eq("签到守护新文案", cfg.ciWindowText(), "08:00 - 21:00");
+
+        // 预约未配置时，签到守护时段内的 delay 计算独立有效
+        int delay = Booker.nextTickDelayMin(10 * 60, cfg.ciBeginMinute, cfg.ciEndMinute, false, -1, false);
+        eq("即使未配置预约，签到时段内依然正常按 5 分钟巡检", delay, 5);
+
+        // 守护时段非法时正确判断
+        cfg.ciEndMinute = cfg.ciBeginMinute;
+        ok("签到结束等于开始时无效", !cfg.hasCiWindow());
+    }
+
     /* ---------------- 6d. freeSeatIds 混了非空座（真机日志抓到的） ------------ */
     static void freeSeatFiltering() {
         System.out.println("\n[6d] freeSeatIds 必须过滤 AWAY / FULL（线上真实样本）");
@@ -378,5 +410,158 @@ public class Verify {
         eq("firstStr 跳过 null", Booker.firstStr(j("{\"a\":null,\"b\":\"y\"}"), "a", "b"), "y");
         eq("firstStr 数字转字符串", Booker.firstStr(j("{\"a\":9001}"), "a"), "9001");
         eq("firstStr 全空返回 null", Booker.firstStr(j("{\"a\":\"\"}"), "a", "z"), null);
+    }
+
+    /* ---------------- 8. 签到状态 / 暂离守护 ------------------------------- */
+    // currentUseMake 的字段名抄自站点自己的 currentBook（与 freeBook 的 orderObj 同一套：
+    // makeDateStr / makeBeginStr / makeEndStr / location / seatLabel），status 文案来自
+    // bundle 里的 my.table1.status1..8；排期期望值是手算的。
+    static void checkInWatch() {
+        System.out.println("\n[8] 当前预约状态 / 暂离守护排期");
+
+        eq("data 为空对象 = 没有有效预约", Booker.parseNow(j("{\"status\":true,\"data\":{}}")).has, false);
+        eq("data 为 null = 没有有效预约", Booker.parseNow(j("{\"status\":true,\"data\":null}")).has, false);
+        eq("status=false = 没有有效预约", Booker.parseNow(j("{\"status\":false,\"message\":\"x\"}")).has, false);
+        eq("null 响应不崩", Booker.parseNow(null).has, false);
+        eq("形状不认识时当作没有", Booker.parseNow(j("{\"status\":true,\"data\":{\"foo\":1}}")).has, false);
+
+        Booker.Now away = Booker.parseNow(j("{\"status\":true,\"data\":{"
+                + "\"id\":\"1878649390807224320\",\"status\":\"AWAY\","
+                + "\"makeDateStr\":\"2026-09-25\",\"makeBeginStr\":\"10:00\",\"makeEndStr\":\"12:00\","
+                + "\"location\":\"图书馆|三层A区\",\"seatLabel\":\"B102\"}}"));
+        eq("有有效预约", away.has, true);
+        eq("状态原样取出", away.state, "AWAY");
+        eq("日期", away.date, "2026-09-25");
+        eq("开始/结束", away.begin + "-" + away.end, "10:00-12:00");
+        ok("文案里地点竖线还原成空格", away.text().contains("图书馆 三层A区"));
+        ok("文案里带座位号", away.text().contains("B102"));
+        ok("AWAY 的中文是「暂离」", away.text().startsWith("暂离"));
+        eq("小写状态也认", Booker.parseNow(j("{\"status\":true,\"data\":{\"id\":1,\"status\":\"away\"}}"))
+                .state, "AWAY");
+        eq("没有有效预约的文案", Booker.parseNow(j("{\"status\":true,\"data\":{}}")).text(),
+                "服务端说此刻没有有效预约");
+
+        eq("状态文案 CHECK_IN", Booker.stateText("CHECK_IN"), "履约中（已签到）");
+        eq("状态文案 RESERVE", Booker.stateText("RESERVE"), "预约（未签到）");
+        eq("状态文案 MISS", Booker.stateText("MISS"), "失约");
+        eq("状态文案 NO_STOP", Booker.stateText("NO_STOP"), "未签退");
+        eq("状态文案全小写也认", Booker.stateText("leave_early"), "早退");
+        eq("没见过的状态原样显示", Booker.stateText("WEIRD"), "WEIRD");
+
+        eq("12:05 → 725", Booker.minuteText("12:05"), 725);
+        eq("07:00 → 420", Booker.minuteText("07:00"), 420);
+        eq("带秒也认", Booker.minuteText("07:00:30"), 420);
+        eq("空返回 -1", Booker.minuteText(null), -1);
+        eq("坏输入返回 -1", Booker.minuteText("25:99"), -1);
+
+        ok("结束时刻能解析", Booker.endAtMillis("2026-09-25", "12:00") > 0);
+        eq("结束时刻坏输入", Booker.endAtMillis("x", "12:00"), -1L);
+        eq("结束时刻缺一半", Booker.endAtMillis(null, "12:00"), -1L);
+
+        eq("tokenGone: 20003", Booker.tokenGone(j("{\"status\":false,\"code\":20003}")), true);
+        eq("tokenGone: 正常响应", Booker.tokenGone(j("{\"status\":true,\"data\":{}}")), false);
+        eq("tokenGone: null", Booker.tokenGone(null), false);
+
+        int B = 10 * 60, E = 12 * 60;
+        eq("时段开始前：睡到「开始 - 5 分钟」", Booker.nextTickDelayMin(9 * 60 + 30, B, E, false, -1, false), 25);
+        eq("时段内：每 5 分钟", Booker.nextTickDelayMin(10 * 60 + 30, B, E, true, -1, false), 5);
+        eq("正好到提前量：进入巡检节奏", Booker.nextTickDelayMin(9 * 60 + 55, B, E, false, -1, false), 5);
+        eq("时段尾巴内还盯一会儿", Booker.nextTickDelayMin(12 * 60 + 3, B, E, false, -1, false), 2);
+        eq("出了时段尾巴：收工", Booker.nextTickDelayMin(12 * 60 + 10, B, E, false, -1, false), -1);
+        eq("记录自己说 12:00 才结束 → 过了尾巴也继续盯",
+                Booker.nextTickDelayMin(12 * 60 + 10, B, E, true, E, false), 5);
+        eq("没配时段、今天有预约 → 每 5 分钟", Booker.nextTickDelayMin(10 * 60, -1, -1, true, -1, false), 5);
+        eq("没配时段、没有预约 → 收工", Booker.nextTickDelayMin(10 * 60, -1, -1, false, -1, false), -1);
+        eq("时段非法（结束早于开始）视作没配", Booker.nextTickDelayMin(10 * 60, E, B, false, -1, false), -1);
+        eq("暂离中：2 分钟一枪（要盯着释放时间）",
+                Booker.nextTickDelayMin(10 * 60 + 30, B, E, true, -1, true), 2);
+        eq("暂离中也不能越过时段尾巴",
+                Booker.nextTickDelayMin(12 * 60 + 4, B, E, true, -1, true), 1);
+
+        /* 暂离时刻：记录里的 awayRange → 门禁记录的最后一次离馆 → 第一次观测 */
+        long t1438 = Booker.parseDateTime("2026-09-25 14:38:00", null);
+        ok("awayRange 里的时刻能解析", t1438 > 0);
+        eq("awayRange 只有时间 → 用记录日期补", Booker.awayStartMillis("14:38~15:38", "2026-09-25"), t1438);
+        eq("awayRange 带日期也认", Booker.awayStartMillis("2026-09-25 14:38:00~15:38", "2026-09-25"), t1438);
+        eq("awayRange 用下划线分隔也认", Booker.awayStartMillis("14:38_15:38", "2026-09-25"), t1438);
+        eq("返回了（只有开始）也对", Booker.awayStartMillis("14:38", "2026-09-25"), t1438);
+        eq("同一天多次暂离：只认最后一段",
+                Booker.awayStartMillis("11:00~11:20,14:38~15:38", "2026-09-25"), t1438);
+        eq("空 awayRange（~~）→ -1", Booker.awayStartMillis("~~", "2026-09-25"), -1L);
+        eq("null awayRange → -1", Booker.awayStartMillis(null, "2026-09-25"), -1L);
+
+        /* 变更记录：服务端自己记的暂离时刻（比门禁反推准） */
+        JSONObject life = j("{\"status\":true,\"data\":["
+                + "{\"stage\":\"RESERVE\",\"stageName\":\"预约\",\"createdDate\":\"2026-09-25 09:58:01\"},"
+                + "{\"stage\":\"CHECK_IN\",\"stageName\":\"签到\",\"createdDate\":\"2026-09-25 10:02:11\"},"
+                + "{\"stage\":\"AWAY\",\"stageName\":\"暂离\",\"createdDate\":\"2026-09-25 14:38:07\"},"
+                + "{\"stage\":\"LEAVE_EARLY\",\"stageName\":\"早退\",\"createdDate\":\"2026-09-25 15:50:00\"}]}");
+        eq("变更记录里取最近一次暂离",
+                Booker.lastAwayIn(life, "2026-09-25"),
+                Booker.parseDateTime("2026-09-25 14:38:07", null));
+        eq("只有早退没有暂离 → -1",
+                Booker.lastAwayIn(j("{\"status\":true,\"data\":[{\"stageName\":\"早退\",\"createdDate\":\"2026-09-25 15:50:00\"}]}"),
+                        "2026-09-25"), -1L);
+        eq("只有英文 stage 也认",
+                Booker.lastAwayIn(j("{\"status\":true,\"data\":[{\"stage\":\"AWAY\",\"createdDate\":\"2026-09-25 16:40:00\"}]}"),
+                        "2026-09-25"), Booker.parseDateTime("2026-09-25 16:40:00", null));
+        eq("变更记录拿不到 → -1", Booker.lastAwayIn(j("{\"status\":false}"), "2026-09-25"), -1L);
+
+        /* 手动签到（远程）：只有「值得调接口」的状态才真的调，别的如实报告 */
+        eq("没预约 → 不调", Booker.signPlan(Booker.parseNow(j("{\"status\":true,\"data\":{}}"))),
+                Booker.SIGN_NONE);
+        eq("响应为 null → 不调", Booker.signPlan(Booker.parseNow(null)), Booker.SIGN_NONE);
+        eq("暂离 → 要调", Booker.signPlan(nowWith("AWAY")), Booker.SIGN_GO);
+        eq("预约（未签到）→ 要调", Booker.signPlan(nowWith("RESERVE")), Booker.SIGN_GO);
+        eq("小写状态也认", Booker.signPlan(nowWith("reserve")), Booker.SIGN_GO);
+        eq("没见过的状态 → 试一次（以服务端返回为准）", Booker.signPlan(nowWith("WEIRD")),
+                Booker.SIGN_GO);
+        eq("有记录但没状态 → 试一次",
+                Booker.signPlan(Booker.parseNow(j("{\"status\":true,\"data\":{\"id\":\"1\"}}"))),
+                Booker.SIGN_GO);
+        eq("已经履约中 → 不重复调", Booker.signPlan(nowWith("CHECK_IN")), Booker.SIGN_DONE);
+        eq("早退 → 不调", Booker.signPlan(nowWith("LEAVE_EARLY")), Booker.SIGN_DEAD);
+        eq("已结束 → 不调", Booker.signPlan(nowWith("STOP")), Booker.SIGN_DEAD);
+        eq("未签退 → 不调", Booker.signPlan(nowWith("NO_STOP")), Booker.SIGN_DEAD);
+        eq("失约 → 不调", Booker.signPlan(nowWith("MISS")), Booker.SIGN_DEAD);
+        eq("已取消 → 不调", Booker.signPlan(nowWith("CANCEL")), Booker.SIGN_DEAD);
+
+        /* 兜底：拿不到离座时刻时往前推一个巡检间隔（宁可早算，别晚算） */
+        eq("兜底时刻 = 观测时刻 - 5 分钟", Booker.fallbackSince(1000000L), 1000000L - 5 * 60000L);
+
+        /* 登录态失效后的重试节奏：窗口内 30 分钟，出了窗口收工 */
+        eq("失效后：窗口内 30 分钟再试", Booker.stallDelayMin(10 * 60 + 30, B, E), 30);
+        eq("失效后：窗口前也按 30 分钟（不早于窗口起点）", Booker.stallDelayMin(9 * 60 + 30, B, E), 30);
+        eq("失效后：一大早就等很久", Booker.stallDelayMin(6 * 60, B, E), 235);
+        eq("失效后：出了窗口就收工", Booker.stallDelayMin(12 * 60 + 10, B, E), -1);
+
+        JSONObject door = j("{\"code\":200,\"data\":["        // 门禁：0=入馆, 1=离馆
+                + "{\"direction\":0,\"doorName\":\"东门\",\"dateTimeStr\":\"2026-09-25 13:00:00\"},"
+                + "{\"direction\":1,\"doorName\":\"东门\",\"dateTimeStr\":\"2026-09-25 14:38:12\"},"
+                + "{\"direction\":0,\"doorName\":\"东门\",\"dateTimeStr\":\"2026-09-25 15:10:00\"}]}");
+        eq("门禁取最后一条离馆（漏记入馆时那条依然是 14:38）",
+                Booker.lastLeaveIn(door, "2026-09-25"),
+                Booker.parseDateTime("2026-09-25 14:38:12", null));
+        eq("direction 是字符串也认",
+                Booker.lastLeaveIn(j("{\"code\":200,\"data\":[{\"direction\":\"1\",\"dateTimeStr\":\"09:10:00\"}]}"),
+                        "2026-09-25"), Booker.parseDateTime("2026-09-25 09:10:00", null));
+        eq("门禁没有任何离馆记录 → -1",
+                Booker.lastLeaveIn(j("{\"code\":200,\"data\":[{\"direction\":0,\"dateTimeStr\":\"09:10:00\"}]}"),
+                        "2026-09-25"), -1L);
+        eq("门禁接口失败 → -1", Booker.lastLeaveIn(j("{\"code\":500,\"data\":null}"), "2026-09-25"), -1L);
+        eq("门禁：status 外壳也认",
+                Booker.lastLeaveIn(j("{\"status\":true,\"data\":[{\"direction\":1,\"dateTimeStr\":\"09:10:00\"}]}"),
+                        "2026-09-25"), Booker.parseDateTime("2026-09-25 09:10:00", null));
+        eq("isLeave: 1 = 离馆", Booker.isLeave("1"), true);
+        eq("isLeave: 0 = 入馆", Booker.isLeave("0"), false);
+        eq("isLeave: 中文也认", Booker.isLeave("离馆"), true);
+
+        /* 宽限：平时 60 分钟，饭点（11:00-13:30）120 分钟 */
+        int MS = 11 * 60, ME = 13 * 60 + 30;
+        eq("14:38 离座 → 1 小时", Booker.graceMin(14 * 60 + 38, MS, ME, 120, 60), 60);
+        eq("11:30 离座（饭点）→ 2 小时", Booker.graceMin(11 * 60 + 30, MS, ME, 120, 60), 120);
+        eq("饭点起点 11:00 算饭点", Booker.graceMin(MS, MS, ME, 120, 60), 120);
+        eq("饭点终点 13:30 不算饭点", Booker.graceMin(ME, MS, ME, 120, 60), 60);
+        eq("离座时刻未知 → 按平时算", Booker.graceMin(-1, MS, ME, 120, 60), 60);
     }
 }
