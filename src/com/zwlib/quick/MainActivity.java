@@ -565,7 +565,7 @@ public class MainActivity extends Activity {
                                 + "· 记住学工号和密码，7 天到期后自动填好，只需再输一次验证码\n"
                                 + "· 座位系统登录态过期时自动续上，不再弹「重新触发统一认证」\n\n"
                                 + "密码用系统 Keystore 加密，只存在这台设备上；"
-                                + "登录页右下角的 ⚙ 可以随时关闭并清除。")
+                                + "登录页右下角设置按钮可以随时关闭并清除。")
                         .setCancelable(false)
                         .setPositiveButton("开启", new DialogInterface.OnClickListener() {
                             @Override
@@ -809,7 +809,7 @@ public class MainActivity extends Activity {
         ciHead.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView ciTitle = new TextView(this);
-        ciTitle.setText("📌 入馆签到 & 座位守护");
+        ciTitle.setText("入馆签到 & 座位守护");
         ciTitle.setTextSize(16f);
         ciTitle.setTypeface(Typeface.DEFAULT_BOLD);
         ciTitle.setTextColor(0xFF1A1A1A);
@@ -845,7 +845,7 @@ public class MainActivity extends Activity {
         LinearLayout ciBtnRow = new LinearLayout(this);
         ciBtnRow.setOrientation(LinearLayout.HORIZONTAL);
 
-        TextView btnSignNow = buildButton("⚡ 立即签到", 0xFF8C1B22, 0xFFFFFFFF, true, new Runnable() {
+        TextView btnSignNow = buildButton("立即签到", 0xFF8C1B22, 0xFFFFFFFF, true, new Runnable() {
             @Override
             public void run() {
                 signNow();
@@ -883,7 +883,7 @@ public class MainActivity extends Activity {
         bkHead.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView bkTitle = new TextView(this);
-        bkTitle.setText("⏰ 定时自动预约");
+        bkTitle.setText("定时自动预约");
         bkTitle.setTextSize(16f);
         bkTitle.setTypeface(Typeface.DEFAULT_BOLD);
         bkTitle.setTextColor(0xFF1A1A1A);
@@ -994,7 +994,7 @@ public class MainActivity extends Activity {
         // 4. 快捷工具与系统
         addSection(box, "快捷工具与系统");
 
-        addItem(box, "自动登录", autoOn() ? "已开启 ✓（记住密码与 Token）" : "已关闭", new Runnable() {
+        addItem(box, "自动登录", autoOn() ? "已开启（记住密码与会话）" : "已关闭", new Runnable() {
             @Override
             public void run() {
                 boolean on = !autoOn();
@@ -1045,7 +1045,7 @@ public class MainActivity extends Activity {
 
         addItem(box, "后台可靠性与权限",
                 (!Scheduler.ignoringBatteryOptimizations(this) || !Scheduler.canExactAlarm(this))
-                        ? "⚠ 权限不全，点此检查" : "省电白名单 & 精确闹钟权限正常 ✓",
+                        ? "权限受限，点此检查" : "省电白名单与精确闹钟正常",
                 new Runnable() {
             @Override
             public void run() {
@@ -1117,16 +1117,16 @@ public class MainActivity extends Activity {
         String bigStatusTitle;
         int statusColor;
         if (lastWatch != null && (lastWatch.contains("履约中") || lastWatch.contains("CHECK_IN"))) {
-            bigStatusTitle = "🟢 当前履约中（已签到）";
+            bigStatusTitle = "● 当前履约中（已签到）";
             statusColor = 0xFF12683C;
         } else if (lastWatch != null && (lastWatch.contains("暂离") || lastWatch.contains("AWAY"))) {
-            bigStatusTitle = "🟠 当前状态为「暂离」";
+            bigStatusTitle = "● 当前状态为「暂离」";
             statusColor = 0xFF8A6D00;
         } else if (lastWatch != null && (lastWatch.contains("未签到") || lastWatch.contains("RESERVE"))) {
-            bigStatusTitle = "🔴 已预约待签到";
+            bigStatusTitle = "● 已预约待签到";
             statusColor = 0xFFB00020;
         } else {
-            bigStatusTitle = "⚪ 暂无在座预约记录";
+            bigStatusTitle = "○ 暂无在座预约记录";
             statusColor = 0xFF6B6B70;
         }
 
@@ -1159,7 +1159,7 @@ public class MainActivity extends Activity {
         refreshRow.setGravity(Gravity.END);
         refreshRow.setPadding(0, dp(10), 0, 0);
 
-        TextView btnRefresh = buildButton("🔄 刷新在馆状态", 0x148C1B22, 0xFF8C1B22, true, new Runnable() {
+        TextView btnRefresh = buildButton("刷新在馆状态", 0x148C1B22, 0xFF8C1B22, true, new Runnable() {
             @Override
             public void run() {
                 checkSeatNow();
@@ -1432,38 +1432,21 @@ public class MainActivity extends Activity {
         box.addView(card, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // 问题提示：登录 / 时间段 / 省电白名单，各自一行，不再互相覆盖
+        // 问题提示：登录 / 时间段 / 省电白名单，各自卡片展示，清晰规范
         String warn = null;
         if (sec.get("session") == null) {
-            warn = "还没在本 App 里登录过：先回页面登录一次，否则拿不到 token，下面全是空的。";
+            warn = "还没在本 App 里登录过：先回页面登录一次，否则拿不到 token。";
         } else if (!cfg.hasWindow()) {
-            warn = "还没设时间段 —— 现在启用也不会执行。";
+            warn = "尚未设置预约时间段，启用后将无法自动下单。";
         }
         if (warn != null) {
-            TextView w = new TextView(this);
-            w.setTextSize(13f);
-            w.setTextColor(0xFFB00020);
-            w.setPadding(dp(4), dp(12), dp(4), 0);
-            w.setText("\u26a0 " + warn);
-            box.addView(w);
+            addNotice(box, "提示：" + warn, true);
         }
         if (!Scheduler.ignoringBatteryOptimizations(this)) {
-            TextView w2 = new TextView(this);
-            w2.setTextSize(13f);
-            w2.setTextColor(0xFFB00020);
-            w2.setPadding(dp(4), dp(12), dp(4), 0);
-            w2.setText("\u26a0 没进省电白名单：小米/华为/OPPO/vivo 可能到点直接拦掉。"
-                    + "下面的「后台可靠性 → 省电白名单」开一下。");
-            box.addView(w2);
+            addNotice(box, "注意：未加入省电白名单，后台可能被系统拦截。请在下方开启。", true);
         }
         if (!Scheduler.canExactAlarm(this)) {
-            TextView w3 = new TextView(this);
-            w3.setTextSize(13f);
-            w3.setTextColor(0xFFB00020);
-            w3.setPadding(dp(4), dp(12), dp(4), 0);
-            w3.setText("\u26a0 没给「闹钟和提醒」权限：定时预约和座位守护都可能晚几十分钟，"
-                    + "守护会赶不上释放前那一刻。下面的「后台可靠性 → 闹钟与提醒权限」开一下。");
-            box.addView(w3);
+            addNotice(box, "注意：未授予精确闹钟权限，定时任务可能延迟。请在下方开启。", true);
         }
 
         addPrimary(box, cfg.enabled ? "停用定时预约" : "启用定时预约",
@@ -1486,13 +1469,13 @@ public class MainActivity extends Activity {
                     StringBuilder m = new StringBuilder("已启用：每天 ")
                             .append(cfg.timeText()).append(" 自动预约");
                     if (Scheduler.willFireTomorrow(cfg.minuteOfDay)) {
-                        m.append("\n\n\u26a0 今天这个点已经过了，第一次触发是【明天 ")
+                        m.append("\n\n提示：今天该时间已过，首次触发为【明天 ")
                                 .append(cfg.timeText()).append("】");
                     } else {
                         m.append("（今天就会生效）");
                     }
                     if (cfg.dryRun) {
-                        m.append("\n\n\u26a0 试运行还开着 —— 到点只会查询，不会真下单");
+                        m.append("\n\n提示：试运行处于开启状态，到点仅查询不实际下单。");
                     }
                     Toast.makeText(MainActivity.this, m.toString(), Toast.LENGTH_LONG).show();
                 } else {
@@ -1608,7 +1591,7 @@ public class MainActivity extends Activity {
         addSection(box, "后台可靠性");
 
         addItem(box, "省电白名单", Scheduler.ignoringBatteryOptimizations(this)
-                ? "已加入 ✓" : "未加入 —— 点这里开启（7:30 能不能准时响全靠它）", new Runnable() {
+                ? "已加入" : "未加入 —— 点此开启（后台准时唤醒必备）", new Runnable() {
             @Override
             public void run() {
                 askBatteryWhitelist();
@@ -1616,7 +1599,7 @@ public class MainActivity extends Activity {
         });
 
         addItem(box, "闹钟与提醒权限", Scheduler.canExactAlarm(this)
-                ? "已授权 ✓" : "未授权 —— 守护会迟到，点这里去开", new Runnable() {
+                ? "已授权" : "未授权 —— 避免任务延迟，点此开启", new Runnable() {
             @Override
             public void run() {
                 askExactAlarmPermission();
@@ -1649,20 +1632,7 @@ public class MainActivity extends Activity {
         });
 
         // 底部提示卡片：签到已单列
-        LinearLayout tipCard = new LinearLayout(this);
-        tipCard.setOrientation(LinearLayout.VERTICAL);
-        tipCard.setBackground(cardBg(0xFFFFFFFF, 0x14000000, 14));
-        tipCard.setPadding(dp(14), dp(12), dp(14), dp(12));
-        TextView tipText = new TextView(this);
-        tipText.setTextSize(12.5f);
-        tipText.setTextColor(0xFF6B6B70);
-        tipText.setText("💡 签到与座位守护已单列至专属面板，可从「控制中心 → 签到与守护」进入进行管理和远程签到。");
-        tipCard.addView(tipText);
-
-        LinearLayout.LayoutParams lpTip = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lpTip.topMargin = dp(14);
-        box.addView(tipCard, lpTip);
+        addNotice(box, "提示：签到与座位守护已单列至专属面板，可从「控制中心 → 入馆签到 & 座位守护」进入进行管理和远程签到。", false);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
@@ -1691,7 +1661,7 @@ public class MainActivity extends Activity {
         box.setPadding(p, dp(10), p, dp(14));
 
         addItem(box, "省电白名单", Scheduler.ignoringBatteryOptimizations(this)
-                ? "已加入 ✓" : "未加入 —— 点这里开启（准时唤醒必备）", new Runnable() {
+                ? "已加入" : "未加入 —— 点此开启（准时唤醒必备）", new Runnable() {
             @Override
             public void run() {
                 askBatteryWhitelist();
@@ -1699,7 +1669,7 @@ public class MainActivity extends Activity {
         });
 
         addItem(box, "闹钟与提醒权限", Scheduler.canExactAlarm(this)
-                ? "已授权 ✓" : "未授权 —— 闹钟会迟到，点这里去开", new Runnable() {
+                ? "已授权" : "未授权 —— 避免任务延迟，点此开启", new Runnable() {
             @Override
             public void run() {
                 askExactAlarmPermission();
@@ -1850,6 +1820,21 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(8);
         parent.addView(row, lp);
+    }
+
+    /** 提示与警告卡片（无 emoji，现代卡片质感） */
+    private void addNotice(LinearLayout parent, String text, boolean isAlert) {
+        TextView w = new TextView(this);
+        w.setTextSize(12.5f);
+        w.setTextColor(isAlert ? 0xFFB00020 : 0xFF6B6B70);
+        w.setLineSpacing(dp(2), 1f);
+        w.setBackground(cardBg(isAlert ? 0xFFFFF5F5 : 0xFFFFFFFF, isAlert ? 0x22B00020 : 0x14000000, 10));
+        w.setPadding(dp(13), dp(10), dp(13), dp(10));
+        w.setText(text);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(10);
+        parent.addView(w, lp);
     }
 
     /** 主操作按钮：实心品牌色 + 白色粗体 + 按压涟漪 */
@@ -2540,7 +2525,7 @@ public class MainActivity extends Activity {
             showCopyable(out.title, out.detail);
             return;
         }
-        showCopyable("✅ 真实预约成功", out.detail
+        showCopyable("真实预约成功", out.detail
                 + (out.bookingId == null || out.bookingId.isEmpty()
                         ? "" : "\n\n预约 id: " + out.bookingId)
                 + "\n\n这个 App 不会替你取消 —— "

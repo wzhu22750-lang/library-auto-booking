@@ -1860,7 +1860,7 @@ final class Booker {
                 }
                 String m = resp == null ? "请求没拿到有效响应" : resp.optString("message");
                 boolean seatIssue = m != null && (m.contains("座位") || m.contains("时段"));
-                log.append("    ✗ 座位 ").append(cl).append(" 被拒：").append(m).append('\n');
+                log.append("    · 座位 ").append(cl).append(" 被拒：").append(m).append('\n');
                 if (!seatIssue) {
                     // 不是"换一个就行"的问题（比如验证码/黑名单），重试没意义
                     Outcome o = Outcome.fail("下单被拒: " + m);
